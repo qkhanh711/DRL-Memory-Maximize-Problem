@@ -201,7 +201,7 @@ class Diffusion_QL(object):
         with torch.no_grad():
             action = self.actor.sample(state_rpt)
             q_value = self.critic_target.q_min(state_rpt, action).flatten()
-            idx = torch.multinomial(F.softmax(q_value), 1)
+            idx = torch.multinomial(F.softmax(q_value, dim=0), 1)
         return action[idx].cpu().data.numpy().flatten()
 
     def save_model(self, dir, id=None):

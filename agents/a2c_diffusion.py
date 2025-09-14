@@ -200,7 +200,7 @@ class Diffusion_A2C(object):
             action = self.actor.sample(state_rpt)
             # Use value function to guide action selection
             values = self.critic(state_rpt).flatten()
-            idx = torch.multinomial(F.softmax(values), 1)
+            idx = torch.multinomial(F.softmax(values, dim=0), 1)
         return action[idx].cpu().data.numpy().flatten()
 
     def save_model(self, dir, id=None):
