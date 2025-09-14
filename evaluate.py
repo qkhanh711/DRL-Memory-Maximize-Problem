@@ -13,7 +13,6 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 import time
 
-# Add project root to path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from env.m_env import GAIServiceEnv_v1, EnvConfig_v1
