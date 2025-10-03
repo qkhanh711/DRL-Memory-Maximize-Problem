@@ -1,139 +1,89 @@
 #!/bin/bash
 
-# ============================================================
-# CONFIGURATION PARAMETERS
-# ============================================================
-NUM_EPISODES=500
-NUM_STEPS=10
-SEED=42
-
-# Training parameters
-MAX_TRAINING_STEPS=50000
-MAX_EPISODE_LENGTH=10
-EVAL_FREQUENCY=25
-PRINT_FREQUENCY=5
-SAVE_FREQUENCY=50
-
-# Analysis parameters
-USER_COUNTS="8 10 12"
-ANALYSIS_EPISODES=20
-ANALYSIS_STEPS=300
-CONVERGENCE_EPISODES=50
-CONVERGENCE_STEPS=1000
+set -euo pipefail
 
 echo "============================================================"
-echo "DRL Memory Maximize Problem - Complete Analysis Pipeline"
-echo "============================================================"
-echo "Configuration:"
-echo "  NUM_EPISODES: $NUM_EPISODES"
-echo "  NUM_STEPS: $NUM_STEPS"
-echo "  SEED: $SEED"
-echo "  MAX_TRAINING_STEPS: $MAX_TRAINING_STEPS"
-echo "  USER_COUNTS: $USER_COUNTS"
+echo "Run convergence_analyze.py with passed or shortcut commands"
 echo "============================================================"
 
-# Create directories
+# Shortcuts:
+#   bash run.sh analyze [extra args]            -> --run_performance
+#   bash run.sh convergence [extra args]        -> --run_convergence
+#   bash run.sh replot-analyze [extra args]     -> --replot --run_performance
+#   bash run.sh replot-convergence [extra args] -> --replot --run_convergence
+#   bash run.sh dashboard [extra args]          -> --run_dashboard
+
+CMD_ARGS=("$@")
+
+if [ ${#CMD_ARGS[@]} -eq 0 ] || [ "${CMD_ARGS[0]}" = "help" ]; then
+	echo "Usage:"
+	echo "  bash run.sh analyze [--user_counts 8 10 12] [--episodes 50] [--max_steps 1000]"
+	echo "  bash run.sh convergence [--agents ...] [--num_users 10] [--episodes 100] [--max_steps 2000] [--save_dir convergence_plots]"
+	echo "  bash run.sh replot-analyze"
+	echo "  bash run.sh replot-convergence [--save_dir convergence_plots]"
+	echo "  bash run.sh dashboard"
+	echo "  bash run.sh [direct args to convergence_analyze.py]"
+fi
+
+# Map shortcuts to full arguments
+case "${CMD_ARGS[0]:-}" in
+	analyze)
+		CMD_ARGS=("--run_performance" "${CMD_ARGS[@]:1}")
+		;;
+	convergence)
+		CMD_ARGS=("--run_convergence" "${CMD_ARGS[@]:1}")
+		;;
+	replot-analyze)
+		CMD_ARGS=("--replot" "--run_performance" "${CMD_ARGS[@]:1}")
+		;;
+	replot-convergence)
+		CMD_ARGS=("--replot" "--run_convergence" "${CMD_ARGS[@]:1}")
+		;;
+	dashboard)
+		CMD_ARGS=("--run_dashboard" "${CMD_ARGS[@]:1}")
+		;;
+esac
+
+# Default values (match convergence_analyze.py defaults)
+SAVE_DIR="convergence_plots"
+
+# Parse --save_dir from args (so we can move it later)
+ARGS=("${CMD_ARGS[@]}")
+for (( i=0; i<${#ARGS[@]}; i++ )); do
+	if [ "${ARGS[$i]}" = "--save_dir" ]; then
+		if [ $((i+1)) -lt ${#ARGS[@]} ]; then
+			SAVE_DIR="${ARGS[$((i+1))]}"
+		fi
+	fi
+done
+
 mkdir -p final_plot
-mkdir -p analysis_plots
-mkdir -p convergence_plots
-mkdir -p logs
 
-# Kill any existing tmux sessions with these names
-tmux kill-session -t train_ppo_diffusion 2>/dev/null || true
-tmux kill-session -t train_gaussian_ppo 2>/dev/null || true
-tmux kill-session -t train_ql_diffusion 2>/dev/null || true
-tmux kill-session -t train_gaussian_dql 2>/dev/null || true
+echo "Using save_dir: ${SAVE_DIR}"
+echo "Running: python convergence_analyze.py ${CMD_ARGS[*]}"
+python convergence_analyze.py "${CMD_ARGS[@]}"
 
 echo ""
-echo "Step 1: Starting parallel training on 2 GPUs..."
-echo "============================================================"
-echo "GPU 0: PPO Diffusion + Gaussian PPO"
-echo "GPU 1: QL Diffusion + Gaussian DQL"
-echo ""
+echo "Moving generated folders into final_plot..."
 
-# Start training sessions
-echo "Starting PPO Diffusion training on CUDA:0..."
-tmux new-session -d -s train_ppo_diffusion "python train.py --agent ppo_diffusion --device cuda:0 --max_steps $MAX_TRAINING_STEPS --max_episode_length $MAX_EPISODE_LENGTH --eval_frequency $EVAL_FREQUENCY --print_frequency $PRINT_FREQUENCY --save_frequency $SAVE_FREQUENCY --seed $SEED"
-
-echo "Starting Gaussian PPO training on CUDA:0..."
-tmux new-session -d -s train_gaussian_ppo "python train.py --agent gaussian_ppo --device cuda:0 --max_steps $MAX_TRAINING_STEPS --max_episode_length $MAX_EPISODE_LENGTH --eval_frequency $EVAL_FREQUENCY --print_frequency $PRINT_FREQUENCY --save_frequency $SAVE_FREQUENCY --seed $SEED"
-
-echo "Starting QL Diffusion training on CUDA:1..."
-tmux new-session -d -s train_ql_diffusion "python train.py --agent ql_diffusion --device cuda:1 --max_steps $MAX_TRAINING_STEPS --max_episode_length $MAX_EPISODE_LENGTH --eval_frequency $EVAL_FREQUENCY --print_frequency $PRINT_FREQUENCY --save_frequency $SAVE_FREQUENCY --seed $SEED"
-
-echo "Starting Gaussian DQL training on CUDA:1..."
-tmux new-session -d -s train_gaussian_dql "python train.py --agent gaussian_dql --device cuda:1 --max_steps $MAX_TRAINING_STEPS --max_episode_length $MAX_EPISODE_LENGTH --eval_frequency $EVAL_FREQUENCY --print_frequency $PRINT_FREQUENCY --save_frequency $SAVE_FREQUENCY --seed $SEED"
-
-echo ""
-echo "All training sessions started!"
-echo "============================================================"
-echo "Monitor training progress with:"
-echo "  tmux attach -t train_ppo_diffusion"
-echo "  tmux attach -t train_gaussian_ppo"
-echo "  tmux attach -t train_ql_diffusion"
-echo "  tmux attach -t train_gaussian_dql"
-echo ""
-echo "List all sessions: tmux list-sessions"
-echo "Kill all sessions: tmux kill-server"
-echo ""
-
-# Wait for all training to complete
-echo "Waiting for all training sessions to complete..."
-echo "This may take a while depending on your hardware..."
-echo ""
-
-# Function to check if all sessions are finished
-wait_for_completion() {
-    while true; do
-        running_sessions=$(tmux list-sessions 2>/dev/null | grep -E "train_(ppo_diffusion|gaussian_ppo|ql_diffusion|gaussian_dql)" | wc -l)
-        if [ "$running_sessions" -eq 0 ]; then
-            break
-        fi
-        echo "Still running: $running_sessions training sessions..."
-        sleep 30
-    done
+# Helper to move a directory into final_plot safely
+move_dir() {
+	local src_dir="$1"
+	if [ -d "$src_dir" ]; then
+		local dst_dir="final_plot/$(basename "$src_dir")"
+		if [ -d "$dst_dir" ]; then
+			rm -rf "$dst_dir"
+		fi
+		mv "$src_dir" final_plot/
+		echo "Moved: $src_dir -> final_plot/"
+	fi
 }
 
-# Wait for completion
-wait_for_completion
+# Move known plot folders
+move_dir "$SAVE_DIR"
+move_dir "analysis_plots"
 
-echo ""
-echo "============================================================"
-echo "TRAINING COMPLETED!"
-echo "============================================================"
+echo "Done. Contents of final_plot/:"
+ls -la final_plot/ || true
 
-echo ""
-echo "Step 2: Running performance analysis..."
-echo "============================================================"
-python analyze_performance.py --agents ppo_diffusion ql_diffusion gaussian_ppo gaussian_dql --user_counts $USER_COUNTS --episodes $ANALYSIS_EPISODES --max_steps $ANALYSIS_STEPS
-
-echo ""
-echo "Step 3: Running convergence plots..."
-echo "============================================================"
-python convergence_plots.py --agents ppo_diffusion ql_diffusion gaussian_ppo gaussian_dql --num_users 10 --episodes $CONVERGENCE_EPISODES --max_steps $CONVERGENCE_STEPS --save_dir convergence_plots
-
-echo ""
-echo "Step 4: Creating final comprehensive plots..."
-echo "============================================================"
-python create_final_plots.py
-
-echo ""
-echo "Step 5: Organizing output files..."
-echo "============================================================"
-# Move all generated files to final_plot directory
-mv *.png *.csv final_plot/ 2>/dev/null || true
-mv analysis_plots/ final_plot/ 2>/dev/null || true
-mv convergence_plots/ final_plot/ 2>/dev/null || true
-mv logs/ final_plot/ 2>/dev/null || true
-
-echo ""
-echo "============================================================"
-echo "ANALYSIS PIPELINE COMPLETED!"
-echo "============================================================"
-echo "All results saved in: final_plot/"
-echo ""
-echo "Generated files:"
-ls -la final_plot/
-echo ""
-echo "Training logs saved in: final_plot/logs/"
-echo "Analysis complete! Check the final_plot/ directory for all results."
+echo "All folders have been organized into final_plot."

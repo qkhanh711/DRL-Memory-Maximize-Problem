@@ -182,13 +182,13 @@ class GAIServiceEnv_v1(gym.Env):
         else:
             return float(self.rng.uniform(8.0, 16.0))   # excellent
 
-    def _compute_price(self, mem: float, flops: float, comm_bytes: float) -> float:
+    def _compute_price(self, mem: float, latency: float, comm_bytes: float) -> float:
         # print(f"""
         #       {1e-2 * mem}
-        #       {1e-8 * flops}
+        #       {1e-1* latency}
         #       {2.5e-7 * comm_bytes}
         #       """)
-        return float(1e-8 * mem + 1e-6 * flops + 2.5e-7 * comm_bytes)
+        return float(1e-8 * mem + 1e-1 * latency + 2.5e-7 * comm_bytes)
 
     def _served_penalty(self, served_count: int) -> float:
         ratio = served_count / self.config["num_users"]
@@ -278,7 +278,7 @@ class GAIServiceEnv_v1(gym.Env):
                 latency, flops = self._compute_latency(user, steps)
                 mem = self._compute_memory(user)
                 qos = self._compute_qos(steps)
-                price = self._compute_price(mem, flops, user.image_size + user.prompt_size)
+                price = self._compute_price(mem, latency, user.image_size + user.prompt_size)
 
                 pen_q = cfg["lambda_qos"] * relu(qos - user.qos_required)
                 pen_l = cfg["lambda_latency"] * relu(latency - cfg["sys_tau"])
@@ -318,7 +318,9 @@ class GAIServiceEnv_v1(gym.Env):
 
         total_penalty += cfg["lambda_latency"] * relu(total_latency - cfg["sys_tau"])
         # print(total_penalty)
-        total_penalty += cfg["lambda_flops"] * relu(total_flops - cfg["Gmax"])
+        def normalize_flops(flops):
+            return flops / cfg["Gmax"] * 100
+        total_penalty += cfg["lambda_flops"] * relu(normalize_flops(total_flops))
         # print(total_penalty)
         total_penalty += cfg["lambda_mem"] * relu(total_mem - cfg["Mmax"])
         # print(total_penalty)

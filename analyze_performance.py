@@ -53,13 +53,18 @@ def create_agent(agent_name, state_dim, action_dim, max_action, device, **kwargs
         **kwargs
     )
 
-def evaluate_agent_performance(agent_name, num_users, device, episodes=50, max_steps=1000):
-    """Evaluate agent performance for a specific number of users"""
-    print(f"Evaluating {agent_name} with {num_users} users...")
+def evaluate_agent_performance(agent_name, num_users, device, episodes=50, max_steps=1000, qos_required=None):
+    """Evaluate agent performance for a specific number of users
+
+    If qos_required is provided, overrides the environment QoS target.
+    """
+    print(f"Evaluating {agent_name} with {num_users} users..." + (f" QoS target={qos_required}" if qos_required is not None else ""))
     
     # Create environment with modified number of users
     config = EnvConfig_v1("GAIServiceEnv")
     config["num_users"] = num_users
+    if qos_required is not None:
+        config["qos_required"] = qos_required
     
     env = GAIServiceEnv_v1(config, seed=42)
     state_dim = env.observation_space.shape[0]
@@ -368,6 +373,8 @@ def main():
                        help='Device (cpu/cuda/auto)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
+    parser.add_argument('--qos_requireds', nargs='+', type=float, default=[30],
+                       help='QoS target values to sweep (e.g., 25 30 35)')
     
     args = parser.parse_args()
     
@@ -387,73 +394,139 @@ def main():
     # Results storage
     results_by_users = {}
     convergence_results = {}
+    # For QoS sweep
+    results_by_qos = {}
     
-    # Test each number of users
-    for num_users in args.user_counts:
+    # If multiple QoS values are provided, run a sweep
+    if args.qos_requireds and len(args.qos_requireds) > 1:
+        for qos in args.qos_requireds:
+            print(f"\n{'='*60}\nQoS target sweep: {qos}\n{'='*60}")
+            results_by_qos[qos] = {}
+            for num_users in args.user_counts:
+                print(f"\n{'-'*40}\nTesting with {num_users} users (QoS={qos})\n{'-'*40}")
+                results_by_qos[qos][num_users] = {}
+                for agent_name in args.agents:
+                    try:
+                        metrics = evaluate_agent_performance(
+                            agent_name, num_users, device,
+                            episodes=args.episodes, max_steps=args.max_steps,
+                            qos_required=qos,
+                        )
+                        results_by_qos[qos][num_users][agent_name] = metrics
+                        # Store convergence for reference at a default mid user count (e.g., 10)
+                        if num_users == 10:
+                            convergence_results[f"{agent_name}_q{int(qos)}"] = metrics
+                        print(f"{agent_name}: Final Reward = {metrics['final_reward']:.2f}")
+                    except Exception as e:
+                        print(f"Error evaluating {agent_name} with {num_users} users (QoS={qos}): {e}")
+        
+        # Save raw results for QoS sweep
+        with open('performance_analysis_qos_sweep.json', 'w') as f:
+            def convert_numpy(obj):
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif isinstance(obj, dict):
+                    return {k: convert_numpy(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert_numpy(item) for item in obj]
+                else:
+                    return obj
+            json.dump(convert_numpy(results_by_qos), f, indent=2)
+        
+        # Optionally generate a simple CSV summary of averages
+        try:
+            rows = []
+            for qos, users_dict in results_by_qos.items():
+                for users, agents_dict in users_dict.items():
+                    for agent, m in agents_dict.items():
+                        rows.append({
+                            'QoS_Target': qos,
+                            'Users': users,
+                            'Agent': agent,
+                            'Final_Reward': m.get('final_reward', 0),
+                            'Avg_Memory': m.get('avg_memory', 0),
+                            'Avg_Latency': m.get('avg_latency', 0),
+                            'Avg_QoS': m.get('avg_qos', 0),
+                            'Avg_Denoise_Steps': m.get('avg_denoise_steps', 0),
+                        })
+            if rows:
+                df = pd.DataFrame(rows)
+                df.to_csv('analysis_plots/qos_sweep_summary.csv', index=False)
+                print("Saved QoS sweep summary CSV to analysis_plots/qos_sweep_summary.csv")
+        except Exception as e:
+            print(f"Warning: failed to save QoS sweep summary CSV: {e}")
+        
+        # Also build a convergence plot for quick visual if available
+        if convergence_results:
+            plot_convergence_rewards(convergence_results, save_path='convergence_rewards_qos_sweep.png')
+        
+    else:
+        # Original behavior (single QoS value, default 30)
+        for num_users in args.user_counts:
+            print(f"\n{'='*60}")
+            print(f"Testing with {num_users} users")
+            print(f"{'='*60}")
+            
+            results_by_users[num_users] = {}
+            
+            for agent_name in args.agents:
+                try:
+                    metrics = evaluate_agent_performance(
+                        agent_name, num_users, device, 
+                        episodes=args.episodes, max_steps=args.max_steps,
+                        qos_required=args.qos_requireds[0] if args.qos_requireds else None,
+                    )
+                    results_by_users[num_users][agent_name] = metrics
+                    
+                    # Store convergence data for the default user count (10)
+                    if num_users == 10:
+                        convergence_results[agent_name] = metrics
+                    
+                    print(f"{agent_name}: Final Reward = {metrics['final_reward']:.2f}")
+                    
+                except Exception as e:
+                    print(f"Error evaluating {agent_name} with {num_users} users: {e}")
+        
+        # Generate plots
         print(f"\n{'='*60}")
-        print(f"Testing with {num_users} users")
+        print("Generating Analysis Plots")
         print(f"{'='*60}")
         
-        results_by_users[num_users] = {}
+        # 1. Convergence plot
+        if convergence_results:
+            plot_convergence_rewards(convergence_results)
         
-        for agent_name in args.agents:
-            try:
-                metrics = evaluate_agent_performance(
-                    agent_name, num_users, device, 
-                    episodes=args.episodes, max_steps=args.max_steps
-                )
-                results_by_users[num_users][agent_name] = metrics
-                
-                # Store convergence data for the default user count (10)
-                if num_users == 10:
-                    convergence_results[agent_name] = metrics
-                    
-                print(f"{agent_name}: Final Reward = {metrics['final_reward']:.2f}")
-                
-            except Exception as e:
-                print(f"Error evaluating {agent_name} with {num_users} users: {e}")
-                continue
-    
-    # Generate plots
-    print(f"\n{'='*60}")
-    print("Generating Analysis Plots")
-    print(f"{'='*60}")
-    
-    # 1. Convergence plot
-    if convergence_results:
-        plot_convergence_rewards(convergence_results)
-    
-    # 2. User count analysis
-    if results_by_users:
-        plot_users_analysis(results_by_users)
-    
-    # Save raw results
-    with open('performance_analysis_results.json', 'w') as f:
-        # Convert numpy arrays to lists for JSON serialization
-        def convert_numpy(obj):
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()
-            elif isinstance(obj, dict):
-                return {k: convert_numpy(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [convert_numpy(item) for item in obj]
-            else:
-                return obj
+        # 2. User count analysis
+        if results_by_users:
+            plot_users_analysis(results_by_users)
         
-        json.dump(convert_numpy(results_by_users), f, indent=2)
-    
-    print(f"\n{'='*60}")
-    print("Analysis Complete!")
-    print(f"{'='*60}")
-    print("Generated plots:")
-    print("- convergence_rewards.png: Reward convergence comparison")
-    print("- analysis_plots/reward_vs_users.png: Reward vs number of users")
-    print("- analysis_plots/memory_vs_users.png: Memory usage vs number of users")
-    print("- analysis_plots/latency_vs_users.png: Latency vs number of users")
-    print("- analysis_plots/qos_vs_users.png: QoS vs number of users")
-    print("- analysis_plots/denoise_steps_vs_users.png: Denoise steps vs number of users")
-    print("- analysis_plots/comprehensive_analysis.csv: Detailed comparison table")
-    print("- performance_analysis_results.json: Raw results data")
+        # Save raw results
+        with open('performance_analysis_results.json', 'w') as f:
+            # Convert numpy arrays to lists for JSON serialization
+            def convert_numpy(obj):
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                elif isinstance(obj, dict):
+                    return {k: convert_numpy(v) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [convert_numpy(item) for item in obj]
+                else:
+                    return obj
+            
+            json.dump(convert_numpy(results_by_users), f, indent=2)
+        
+        print(f"\n{'='*60}")
+        print("Analysis Complete!")
+        print(f"{'='*60}")
+        print("Generated plots:")
+        print("- convergence_rewards.png: Reward convergence comparison")
+        print("- analysis_plots/reward_vs_users.png: Reward vs number of users")
+        print("- analysis_plots/memory_vs_users.png: Memory usage vs number of users")
+        print("- analysis_plots/latency_vs_users.png: Latency vs number of users")
+        print("- analysis_plots/qos_vs_users.png: QoS vs number of users")
+        print("- analysis_plots/denoise_steps_vs_users.png: Denoise steps vs number of users")
+        print("- analysis_plots/comprehensive_analysis.csv: Detailed comparison table")
+        print("- performance_analysis_results.json: Raw results data")
 
 if __name__ == "__main__":
     main()
