@@ -4,12 +4,13 @@ import numpy as np
 
 
 def EnvConfig_v1(envName: str):
-    print(f"Using environment configuration for: {envName}")
+    # print(f"Using environment configuration for: {envName}")
     return {
         # System / episode
         "num_users": 10,
-        "T": 10,                    # episode length (steps)
-        "sys_tau": 4,             # system latency budget (s)
+        "T": 5,                    # episode length (steps)
+        "sys_tau": 5.0,             # system latency budget (s)
+        "step_size": 1,           # step size for queue checking (s)
         "Gmax": 5e9,                # FLOPS budget per step
         "Mmax": 48,                 # memory budget (arbitrary units)
 
@@ -18,25 +19,49 @@ def EnvConfig_v1(envName: str):
         "lambda_latency": 0.5,
         "lambda_mem": 1.0,
         "lambda_flops": 1.0,
+        "lambda_price": 1.0,        # NEW: pricing component weight
 
         # Compute / memory capacity
         "PVM": 1e12,                # 1 TFLOPS (bytes/sec when dividing flops? here used as FLOP/s)
         "Rmem": 2.304e12,           # memory bandwidth (bytes/s)
 
         # Denoise step bounds
-        "max_denoise_steps": 25,
+        "max_denoise_steps": 15,
         "min_denoise_steps": 3,
 
-        # Memory model
-        "c1": 3.81e-6,
-        "c2": 4.86,
+        # Piecewise quadratic memory model (NEW)
+        # Lower resolution: a1*px^2 + a2*px + a3
+        "mem_a1": 3.661e-3,
+        "mem_a2": 2.637e-3,
+        "mem_a3": 6807.05,
+        # Mid resolution: constant
+        "mem_const": 110649.59,
+        # High resolution: b1*px^2 + b2*px + b3
+        "mem_b1": 1039e-2,
+        "mem_b2": -32716,
+        "mem_b3": 35948.36,
+        "mem_threshold_low": 1024**2,    # pixels
+        "mem_threshold_high": 1792**2,   # pixels
+        # Old linear model (kept for backward compatibility)
+        # "c1": 3.81e-6,
+        # "c2": 4.86,
 
         # Workload model
         "base_image_size": 1024 * 1024,  # 1 MiB reference
+        "base_resolution": 512 * 512,    # reference resolution in pixels (NEW)
         "GE0": 1e8,       # base FLOPS encoder
         "GD0": 1e8,       # base FLOPS decoder
         "G_eps": 1e8,     # FLOPS per denoise step
         "G_prompt": 1e7,  # FLOPS for prompt processing
+
+        # Pricing model (NEW: explicit FLOPs pricing)
+        "lambda_m": 1e-2,   # memory pricing coefficient
+        "lambda_g": 5e-10,  # FLOPS pricing coefficient
+        "lambda_c": 2.5e-6, # communication pricing coefficient
+
+        # Latency model (NEW: denoising/overhead latency)
+        "t_ldm_overhead": 0.005,  # fixed LDM overhead (s)
+        "t_per_denoise": 0.0005,  # time per denoise step (s)
 
         # Wireless link / geometry
         "sp_pos": np.array([0.0, 0.0, 50.0]),
@@ -50,7 +75,7 @@ def EnvConfig_v1(envName: str):
         # Reward bonus
         "psi": 100,
 
-        # QoS target (lower BRISQUE is better)
+        # QoS target (lower PIQUE is better)
         "qos_required": 30,
     }
 
@@ -65,17 +90,21 @@ class User:
     def reset(self, config=None):
         if config is None:
             config = self.config
-        # Random position on ground plane (x,y), z=0
         self.position = self.rng.uniform(-500.0, 500.0, size=2)
 
-        # Treat sizes as KB for realism, convert to bytes
-        self.image_size = float(self.rng.uniform(100, 350) * 1024.0)  # 100–1000 KB
+        self.image_size =  float(self.rng.uniform(1, 5) * 1024.0 * 1024.0)  #1 - 5 MB
         self.prompt_size = float(self.rng.uniform(1, 10) * 1024.0)   # 10–100 KB
 
         self.direction = float(self.rng.uniform(0.0, 2.0 * np.pi))
         self.qos_required = config["qos_required"]
         self.mobility_speed = float(self.rng.uniform(0.5, 2.0))  # m/step
         self.mobility_angle = self.direction
+        
+        self.is_served = False
+        self.completion_time = None
+        self.assigned_denoise_steps = None
+        self.assigned_resolution = None
+        self.memory_usage = 0.0
 
     def update_position(self):
         dx = self.mobility_speed * np.cos(self.mobility_angle)
@@ -85,15 +114,7 @@ class User:
 
 
 class GAIServiceEnv_v1(gym.Env):
-    """
-    Action: continuous Box in [-1, 1]^(2*num_users)
-      For each user i:
-        a[2*i]   -> serve switch (>=0 => serve, <0 => skip)
-        a[2*i+1] -> normalized denoise in [-1,1] -> mapped to [min_steps, max_steps]
 
-    Observation: concatenated per-user features:
-      [x, y, image_size_bytes, prompt_size_bytes, direction_rad, qos_required] for all users
-    """
     metadata = {"render.modes": []}
 
     def __init__(self, config, seed):
@@ -103,46 +124,190 @@ class GAIServiceEnv_v1(gym.Env):
         self.users = [User(i, config, self.rng) for i in range(config["num_users"])]
 
         n = config["num_users"]
+        
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(6 * n,), dtype=np.float32
+            low=-np.inf,
+            high=np.inf,
+            shape=(6 * n,),
+            dtype=np.float32
         )
-        # Use symmetric action space that matches the internal normalization logic
+
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(2 * n,), dtype=np.float32
+            low =0.0,
+            high=1.0,
+            shape=(3 * n,),  # NEW: denoise_steps (n) + resolutions (n) + serve_decisions (n)
+            dtype=np.float32
         )
+        
+        # NEW: queue management and timing
+        self.queue = []  # users waiting due to memory constraints
+        self.current_time = 0.0
+        self.next_queue_check_time = 0.0
+        self.current_memory_usage = 0.0
+        self.peaked_memory_usage = 0.0  # NEW: track peak memory usage
+        self.total_users_served = 0  # NEW: track total served in entire episode
+        self.total_revenue = 0.0  # NEW: track cumulative revenue across episode
+        self.total_reward = 0.0  # NEW: track cumulative reward across episode
+        self.completed_users = []  # NEW: track indices of users who completed service
 
-        self.time_step = 0
 
-    # ------------- Gym API -------------
+    def map_action_to_decisions(self, action: np.ndarray, config: dict):
+        num_users = self.config["num_users"]
+        denoise_steps = []
+        serve_decisions = []
+        
+        for i in range(num_users):
+            a_ds = action[i]
+            ds = int(self.config["min_denoise_steps"] + a_ds * (self.config["max_denoise_steps"] - self.config["min_denoise_steps"]))
+            denoise_steps.append(ds)
+
+            a_serve = action[2 * num_users + i]
+            serve = 1 if a_serve >= 0.5 else 0
+            serve_decisions.append(serve)
+            
+
+        return denoise_steps, serve_decisions
+        
     def reset(self):
         self.time_step = 0
+        self.current_time = 0.0
+        self.next_queue_check_time = self.config["step_size"]
+        self.current_memory_usage = 0.0
+        self.peaked_memory_usage = 0.0  # NEW: reset peak memory for new episode
+        self.total_flops_accumulated = 0.0
+        self.total_mem_accumulated = 0.0
+        self.avg_latency_last_step = 0.0
+        self.total_users_served = 0  # NEW: reset counter for new episode
+        self.total_revenue = 0.0  # NEW: reset cumulative revenue for new episode
+        self.total_reward = 0.0  # NEW: reset cumulative reward for new episode
+        self.completed_users = []  # NEW: reset completed users list
+        self.queue = []
         for u in self.users:
             u.reset()
         return self._get_state()
 
     def step(self, action: np.ndarray):
         action = np.asarray(action, dtype=np.float32)
-        assert action.shape == (2 * self.config["num_users"],)
-
-        reward, info = self._compute_reward(action)
-        self._move_users()
+        
+        self.current_time += self.config["step_size"]
+        
+        # NEW: Check for any completed users (both in queue and not in queue)
+        self._check_completions()
+        
+        if self.current_time >= self.next_queue_check_time:
+            self._process_queue()
+            self.next_queue_check_time += self.config["step_size"]
+        
+        observation, reward, done, info = self._compute_reward(action)
+        
+        # Increment step counter and check termination
         self.time_step += 1
-        done = bool(self.time_step >= self.config["T"])
-        return self._get_state(), float(reward), done, info
-
-    # ------------- Dynamics & helpers -------------
+        done = bool(self.time_step >= self.config["T"]) or \
+               bool(self.current_time >= self.config["sys_tau"]) or \
+               self._all_users_served()
+        
+        info.update({
+            "current_time": self.current_time,
+            "current_memory_usage": self.current_memory_usage,
+            "queue_size": len(self.queue),
+            "total_users_served": self.total_users_served,  # NEW: total served in episode
+        })
+        
+        if done:
+            pass
+            # print(f"\n{'='*50}")
+            # print(f"EPISODE ENDED - Step {self.time_step}")
+            # print(f"Total users served in entire sys_tau: {self.total_users_served}/{self.config['num_users']}")
+            # print(f"Users completed service (indices): {sorted(self.completed_users)}")
+            # print(f"Peaked memory usage: {self.peaked_memory_usage:.2f}/{self.config['Mmax']} units")
+            # print(f"Total time elapsed: {self.current_time:.2f}s / {self.config['sys_tau']}s")
+            # print(f"{'='*50}\n")
+        
+        return observation, float(reward), done, info
+    
+    def _all_users_served(self) -> bool:
+        return all(u.is_served for u in self.users)
+    
+    def _update_peaked_memory(self):
+        """Update peaked memory if current memory exceeds previous peak"""
+        if self.current_memory_usage > self.peaked_memory_usage:
+            self.peaked_memory_usage = self.current_memory_usage
+    
+    def _check_completions(self):
+        for i, user in enumerate(self.users):
+            if user.is_served and user.completion_time is not None:
+                if self.current_time >= user.completion_time and i not in self.completed_users:
+                    self.completed_users.append(i)
+                    # Free up memory if user was holding memory
+                    if user.memory_usage > 0:
+                        self.current_memory_usage -= user.memory_usage
+                        # print(f"✓ User {i} completed service at {self.current_time:.2f}s, freed {user.memory_usage:.2f} memory")
+                        user.memory_usage = 0  # Reset to avoid double-freeing
+        
+        if self.completed_users:
+            pass
+            # print(f"[Step {self.time_step}] Completed users so far: {sorted(self.completed_users)}")
+    
+    def _process_queue(self):
+        users_to_remove = []
+        for user_id in self.queue:
+            user = self.users[user_id]
+            if user.completion_time is not None and self.current_time >= user.completion_time:
+                # User completed (memory already freed in _check_completions)
+                users_to_remove.append(user_id)
+        
+        # Remove completed users from queue
+        for user_id in users_to_remove:
+            self.queue.remove(user_id)
+        
+        # Try to serve users from queue
+        users_to_serve = []
+        for user_id in self.queue[:]:  # Use slice to avoid modifying during iteration
+            user = self.users[user_id]
+            # Check if user can be served (memory + latency constraints)
+            if self.current_memory_usage + user.memory_usage <= self.config["Mmax"] and \
+               user.assigned_denoise_steps is not None:
+                # Can serve this user
+                users_to_serve.append(user_id)
+                self.current_memory_usage += user.memory_usage
+                self._update_peaked_memory()  # NEW: track peak memory
+                # Calculate completion time
+                user.completion_time = self.current_time + self._calculate_service_time(user)
+                user.is_served = True
+                self.total_users_served += 1  # NEW: count users served from queue
+                
+                # NEW: Add revenue for user served from queue
+                if user.assigned_resolution is not None:
+                    _, flops = self._compute_latency(user, user.assigned_denoise_steps)
+                    price = self._compute_price(
+                        user.memory_usage,
+                        flops,
+                        user.image_size + user.prompt_size
+                    )
+                    self.total_revenue += float(price)
+                
+                self.queue.remove(user_id)
+                # print(f"User {user_id} started service from queue at {self.current_time:.2f}s, " \
+                    #   f"will complete at {user.completion_time:.2f}s")
+    
+    def _calculate_service_time(self, user: User) -> float:
+        if user.assigned_denoise_steps is None:
+            return 0.0
+        latency, _ = self._compute_latency(user, user.assigned_denoise_steps)
+        return latency
+    
     def _get_state(self) -> np.ndarray:
-        state = []
-        for user in self.users:
-            state.extend([
-                float(user.position[0]),
-                float(user.position[1]),
-                float(user.image_size),
-                float(user.prompt_size),
-                float(user.direction),
-                float(user.qos_required),
-            ])
-        return np.array(state, dtype=np.float32)
+       state = []
+       for u in self.users:
+           state.extend([
+               u.position[0],
+               u.position[1],
+               u.image_size,
+               u.prompt_size,
+               u.direction,
+               u.qos_required,
+           ])
+       return np.array(state, dtype=np.float32)
 
     def _move_users(self):
         for user in self.users:
@@ -154,7 +319,7 @@ class GAIServiceEnv_v1(gym.Env):
 
     def _channel_rate(self, distance: float, uplink: bool = True) -> float:
         # Simple pathloss + Shannon capacity model
-        h_i = self.config["h0"] / (distance ** self.config["path_loss"])
+        h_i = self.config["h0"] / (distance ** self.config["path_loss"]) #h_i
         B_i = self.config["bandwidth"] / self.config["num_users"]
         pwr = self.config["upload_power"] if uplink else self.config["download_power"]
         snr = pwr * h_i / (B_i * self.config["noise_power"])
@@ -162,211 +327,240 @@ class GAIServiceEnv_v1(gym.Env):
         return float(rate_bits_per_s / 8.0)  # bytes/s
 
     def _compute_flops(self, user: User, denoise_steps: int) -> float:
-        rho = user.image_size / self.config["base_image_size"]
-        return float(rho * (self.config["GE0"] + self.config["GD0"]
+        pixels = user.image_size / 3.0
+        rho = pixels / self.config["base_resolution"]
+        return float(rho * self.config["GE0"] + self.config["GD0"]
                             + denoise_steps * self.config["G_eps"]
-                            + self.config["G_prompt"]))
+                            + self.config["G_prompt"])
+    
+    def _compute_resolutions(self):
+        resolutions = []
+        for user in self.users:
+            pixels = user.image_size / 3.0
+            res = int(np.sqrt(pixels))
+            resolutions.append(res)
+        return resolutions
 
-    def _compute_memory(self, user: User) -> float:
-        # Simple affine model: memory ~ c1 * image_bytes + c2
-        return float(self.config["c1"] * user.image_size + self.config["c2"])
+    def _compute_memory(self, pixels) -> float:
+        cfg = self.config
+        if pixels <= cfg["mem_threshold_low"]:
+            # Lower resolution: quadratic
+            mem = cfg["mem_a1"] * pixels**2 + cfg["mem_a2"] * pixels + cfg["mem_a3"]
+        elif pixels <= cfg["mem_threshold_high"]:
+            # Mid resolution: constant
+            mem = cfg["mem_const"]
+        else:
+            # High resolution: quadratic
+            mem = cfg["mem_b1"] * pixels**2 + cfg["mem_b2"] * pixels + cfg["mem_b3"]
+        
+        return float(max(mem, 0.0))/1024.0  # convert to arbitrary units
 
     def _compute_qos(self, denoise_steps: int) -> float:
-        # Return a synthetic BRISQUE-like score (lower is better)
+        # Return a synthetic PIQUE-like score (lower is better)
+        # Maps to normalized [0,1] internally for paper consistency
         if denoise_steps < 8:
-            return float(self.rng.uniform(28.0, 36.0))  # poor
+            score = self.rng.uniform(28.0, 36.0)  # poor
         elif denoise_steps < 12:
-            return float(self.rng.uniform(24.0, 32.0))  # fair
+            score = self.rng.uniform(24.0, 32.0)  # fair
         elif denoise_steps < 18:
-            return float(self.rng.uniform(12.0, 18.0))  # good
+            score = self.rng.uniform(12.0, 18.0)  # good
         else:
-            return float(self.rng.uniform(8.0, 16.0))   # excellent
+            score = self.rng.uniform(8.0, 16.0)   # excellent
+        
+        # NEW: normalize to [0,1] matching paper range
+        return float(score)
 
-    def _compute_price(self, mem: float, latency: float, comm_bytes: float) -> float:
-        # print(f"""
-        #       {1e-2 * mem}
-        #       {1e-1* latency}
-        #       {2.5e-7 * comm_bytes}
-        #       """)
-        return float(1e-8 * mem + 1e-1 * latency + 2.5e-7 * comm_bytes)
-
-    def _served_penalty(self, served_count: int) -> float:
-        ratio = served_count / self.config["num_users"]
-        if ratio == 0:
-            return 50
-        elif ratio < 0.3:
-            return 20.0
-        elif ratio < 0.6:
-            return 10.0
-        elif ratio < 0.8:
-            return 5.0
-        else:
-            return -10.0
+    def _compute_price(self, mem: float, flops: float, comm_bytes: float) -> float:
+        # p_i = λ_m * m_i + λ_g * g_i + λ_c * S_i
+        cfg = self.config
+        price = (cfg["lambda_m"] * mem + 
+                 cfg["lambda_g"] * flops + 
+                 cfg["lambda_c"] * comm_bytes)
+        return float(price)
 
     def _compute_latency(self, user: User, denoise_steps: int):
         d = self._distance(user)
 
         rate_up = self._channel_rate(d, uplink=True)
         rate_down = self._channel_rate(d, uplink=False)
-        mem_rate = self.config["Rmem"]              # bytes/s
-        compute_power = self.config["PVM"]          # FLOP/s
+        mem_rate = self.config["Rmem"]              
+        compute_power = self.config["PVM"]          
 
         flops = self._compute_flops(user, denoise_steps)
 
-        # Communication latencies (s)
-        t_up = (user.image_size + user.prompt_size) / max(rate_up, 1e-9)
-        t_down = user.image_size / max(rate_down, 1e-9)
+        t_up = (user.image_size + user.prompt_size) / max(rate_up, 1e-9) * 1e-1
+        t_down = user.image_size / max(rate_down, 1e-9) * 1e-1
 
-        # Memory access latency (s)
         t_mem = (user.image_size + user.prompt_size) / max(mem_rate, 1e-9)
 
-        # Compute latency (s)
-        t_comp = flops / max(compute_power, 1e-9)
+        t_comp = flops / max(compute_power, 1e-9) * 1e2
 
-        # Keep comments aligned with values: these are small overheads (milliseconds)
-        t_ldm_overhead = 0.005    # ~5 ms fixed overhead
-        t_denoise = denoise_steps * 0.0005  # ~0.5 ms per step
-        t_ldm_overhead = 0   # ~5 ms fixed overhead
-        t_denoise = denoise_steps * 0 # ~0.5 m
+        t_ldm_overhead = self.config["t_ldm_overhead"]  # fixed LDM overhead
+        t_denoise = denoise_steps * self.config["t_per_denoise"]  # per-step overhead
         total_latency = t_up + t_mem + t_comp + t_down + t_ldm_overhead + t_denoise
         return float(total_latency), float(flops)
 
-    def _map_action_to_decision(self, a_serve: float, a_steps: float):
-        # serve switch
-        serve = 1 if a_serve >= 0.0 else 0
-
-        # normalized [-1,1] -> [0,1]
-        t = (np.clip(a_steps, -1.0, 1.0) + 1.0) * 0.5
-        min_s = self.config["min_denoise_steps"]
-        max_s = self.config["max_denoise_steps"]
-        denoise_steps = int(np.floor(min_s + t * (max_s - min_s)))
-        denoise_steps = int(np.clip(denoise_steps, min_s, max_s))
-        return serve, denoise_steps
-
     def _compute_reward(self, action: np.ndarray):
-        cfg = self.config
-        N = cfg["num_users"]
-
-        total_reward = 0.0
-        latencies = []
-        total_flops = 0.0
-        total_mem = 0.0
-        total_penalty = 0.0
-        served = 0
-
-        # For richer logging
-        per_user = {
-            "serve": [],
-            "steps": [],
-            "latency": [],
-            "flops": [],
-            "mem": [],
-            "qos": [],
-            "price": [],
-            "pen_qos": [],
-            "pen_lat": [],
-        }
-
-        relu = lambda x: x if x > 0 else 0
-
-        for i, user in enumerate(self.users):
-            a_serve = float(action[2 * i])
-            a_steps = float(action[2 * i + 1])
-            serve, steps = self._map_action_to_decision(a_serve, a_steps)
-
-            if serve:
-                latency, flops = self._compute_latency(user, steps)
-                mem = self._compute_memory(user)
-                qos = self._compute_qos(steps)
-                price = self._compute_price(mem, latency, user.image_size + user.prompt_size)
-
-                pen_q = cfg["lambda_qos"] * relu(qos - user.qos_required)
-                pen_l = cfg["lambda_latency"] * relu(latency - cfg["sys_tau"])
-
-                total_reward += price
-                latencies.append(latency)
-                total_flops += flops
-                total_mem += mem
-                total_penalty += (pen_q + pen_l)
-                # print("pen Q + pen L",total_penalty)
-                served += 1
-
-                per_user["serve"].append(1)
-                per_user["steps"].append(steps)
-                per_user["latency"].append(latency)
-                per_user["flops"].append(flops)
-                per_user["mem"].append(mem)
-                per_user["qos"].append(qos)
-                per_user["price"].append(price)
-                per_user["pen_qos"].append(pen_q)
-                per_user["pen_lat"].append(pen_l)
-            else:
-                per_user["serve"].append(0)
-                per_user["steps"].append(0)
-                per_user["latency"].append(0.0)
-                per_user["flops"].append(0.0)
-                per_user["mem"].append(0.0)
-                per_user["qos"].append(0.0)
-                per_user["price"].append(0.0)
-                per_user["pen_qos"].append(0.0)
-                per_user["pen_lat"].append(0.0)
+        cgf = self.config
+        N = cgf["num_users"]
+        total_served = 0
         
-        if latencies:  
-            total_latency = max(latencies)
-        else:
-            total_latency = 0.0
+        denoise_steps_list, serve_decisions = self.map_action_to_decisions(action, cgf)
+        resolutions = self._compute_resolutions()
+        
+        idx = np.arange(N)
+        lat_flops = np.array([
+            self._compute_latency(self.users[i], denoise_steps_list[i])
+            for i in idx
+        ])
+        latencies = lat_flops[:, 0]
+        flops_list = lat_flops[:, 1]
 
-        total_penalty += cfg["lambda_latency"] * relu(total_latency - cfg["sys_tau"])
-        # print(total_penalty)
-        def normalize_flops(flops):
-            return flops / cfg["Gmax"] * 100
-        total_penalty += cfg["lambda_flops"] * relu(normalize_flops(total_flops))
-        # print(total_penalty)
-        total_penalty += cfg["lambda_mem"] * relu(total_mem - cfg["Mmax"])
-        # print(total_penalty)
-        total_penalty += self._served_penalty(served)
-        # print(total_penalty)
+        memories = np.array([
+            self._compute_memory(resolutions[i])
+            for i in idx
+        ])
 
-        # Bonus if all constraints satisfied
-        bonus = 0.0
-        if (total_latency <= cfg["sys_tau"]
-                and total_flops <= cfg["Gmax"]
-                and total_mem <= cfg["Mmax"]):
-            bonus = float(cfg["psi"])
+        qos_scores = np.array([
+            self._compute_qos(denoise_steps_list[i])
+            for i in idx
+        ])
+        
+        prices = np.array([
+            self._compute_price(
+                memories[i],
+                flops_list[i],
+                self.users[i].image_size + self.users[i].prompt_size
+            )
+            for i in idx
+        ])
+        
+        # print("QoS requirements and denoise steps:")
+        # print(denoise_steps_list)
+        # print(resolutions)
+        # print("Computing latencies and memories...")
+        # print("Latencies:", latencies)
+        # print("Memories:", memories)
+        # print("Prices:", prices)
+        # print("QoS scores:", qos_scores)
 
-        info = dict(
-            total_served=served,
-            total_latency=total_latency,
-            total_flops=total_flops,
-            total_mem=total_mem,
-            penalty=total_penalty,
-            bonus=bonus,
-            per_user=per_user,
-        )
-        # print(f"""
-            #   Total Reward : {total_reward}
-            #   Total Penalty: {total_penalty}
-            #   Total Bonus  : {bonus}
-            #   """)
-        return total_reward - total_penalty + bonus, info
+        served_users = []
+        queued_users = []
+        rejected_users = []
+        
+        for i in idx:
+            user = self.users[i]
+            
+            if serve_decisions[i] == 0:
+                continue
+            
+            if user.is_served or i in self.queue:
+                continue
+            
+            if latencies[i] > cgf["sys_tau"]:
+                # print(f"User {i}: latency {latencies[i]:.3f}s > tau {cgf['sys_tau']}s - rejected")
+                rejected_users.append(i)
+                continue
+            
+            if self.current_memory_usage + memories[i] <= cgf["Mmax"]:
+                self.current_memory_usage += memories[i]
+                self._update_peaked_memory()  # NEW: track peak memory
+                user.is_served = True
+                user.assigned_denoise_steps = denoise_steps_list[i]
+                user.assigned_resolution = resolutions[i]
+                user.memory_usage = memories[i]
+                user.completion_time = self.current_time + latencies[i]
+                served_users.append(i)
+                total_served += 1
+                # print(f"User {i}: served immediately, memory usage: {self.current_memory_usage:.2f}/{cgf['Mmax']}")
+            else:
+                if i not in self.queue:
+                    self.queue.append(i)
+                    user.assigned_denoise_steps = denoise_steps_list[i]
+                    user.assigned_resolution = resolutions[i]
+                    user.memory_usage = memories[i]
+                    queued_users.append(i)
+                    # print(f"User {i}: queued due to memory constraint, would use {memories[i]:.2f} memory")
+        
+        # print(f"Total served: {total_served}, Queued: {len(queued_users)}, Queue size: {len(self.queue)}, Rejected: {len(rejected_users)}")
+        # print(f"Current memory usage: {self.current_memory_usage:.2f}/{cgf['Mmax']}")
+        # print(f"Serve decisions: {serve_decisions}")  # NEW: show decisions made by agent
+        
+        self.total_users_served += total_served
+        
+        # NEW: Accumulate revenue from served users
+        # print(served_users)
+        step_revenue = float(np.sum([prices[i] for i in served_users])) if len(served_users) > 0 else 0.0
+        self.total_revenue += step_revenue
+        
+        # NEW: Compute reward using the formula: R_t = sum_i [ b_i(t)*p_i - lambda_Q*max(0, Q_out - Q_req) - lambda_L*max(0, t_i - tau) + Phi ]
+        reward = 0.0
+        relu = lambda x: max(0.0, x)
+        
+        for i in served_users:
+            # b_i(t) * p_i: payment/revenue from user i
+            price_component = prices[i]
+            
+            # - lambda_Q * max(0, Q_out - Q_req): QoS penalty
+            qos_penalty = cgf.get("lambda_qos", 0.5) * relu(qos_scores[i] - (cgf["qos_required"] / 100.0))
+            
+            # - lambda_L * max(0, t_i - tau): Latency penalty
+            latency_penalty = cgf.get("lambda_latency", 0.5) * relu(latencies[i] - cgf["sys_tau"])
+            
+            # + Phi: bonus for serving
+            phi_bonus = cgf.get("psi", 100)
+            
+            # Sum: b_i*p_i - lambda_Q*penalty_qos - lambda_L*penalty_latency + Phi
+            # print(i, price_component, qos_penalty, latency_penalty, phi_bonus)
+            user_reward = 1.5 * price_component - 1.2 * qos_penalty - 0.9 * latency_penalty + phi_bonus
+            reward += user_reward
+        
+        # print(reward)
+        self.total_reward += reward
+        # print("Cumulative reward so far:", self.total_reward) 
+        # print()
+        done = False
+        
+        info = {
+            # "served_users": served_users,
+            "reward" : float(self.total_reward),
+            "mean_latency": float(np.mean(latencies)) if len(latencies) > 0 else 0.0,
+            "peaked_mem": float(self.peaked_memory_usage),
+            "total_users_served": self.total_users_served,
+            "total_revenue": float(self.total_revenue),  # NEW: cumulative revenue across episode
+            "qos_scores": float(np.mean(qos_scores)) if len(qos_scores) > 0 else 0.0,
+            "qos_violations": int(np.sum(qos_scores > (cgf["qos_required"] / 100.0))),
+        }
+        
+        return self._get_state(), reward, done, info
 
+    def seed(self, seed=None):
+        self.rng = np.random.default_rng(seed)
 
 if __name__ == "__main__":
     cfg = EnvConfig_v1("GAIServiceEnv")
     env = GAIServiceEnv_v1(cfg, seed=42)
-    state = env.reset()
 
-    print("Initial state shape:", state.shape)
 
-    # Random policy demo
-    action = env.action_space.sample()
-    print("\n=== ONE STEP ===")
-    obs, reward, done, info = env.step(action)
-    print("Reward:", reward)
-    print("Done:", done)
-    print("Served:", info["total_served"])
-    print("Total latency:", f"{info['total_latency']:.6f}")
-    print("Total FLOPS:", f"{info['total_flops']:.0f}")
-    print("Total memory:", f"{info['total_mem']:.3f}")
-    print("Bonus:", info["bonus"])
-    print("Penalty:", f"{info['penalty']:.6f}")
+
+    n_tests = 100
+    
+    for test_id in range(n_tests):
+        print(f"\n########## TEST EPISODE {test_id} ##########")
+        state = env.reset()
+
+
+        action = env.action_space.sample()
+        # print("\n=== STEP 0 ===")
+        observation, reward, done, info = env.step(action)
+        i = 0
+        while not done:
+            i += 1
+            action = env.action_space.sample()
+            old_reward = reward
+            observation, new_reward, done, info = env.step(action)
+            # print(f"\n=== STEP {i} ===")
+            print("Reward:", old_reward+new_reward)
+            # print("Done:", done)
+            print("Info:", info)
+            # print("Next observation shape:", observation.shape)
