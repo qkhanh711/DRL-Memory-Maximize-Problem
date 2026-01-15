@@ -89,10 +89,11 @@ def train_agent(agent_name, config, train_config, device):
     replay_buffer = ReplayBuffer(max_size=train_config['buffer_size'], device=device)
     
     # Create logger
-    log_dir = f"logs/{agent_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # log_dir = f"logs/{agent_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_dir = f"logs/{agent_name}"
     os.makedirs(log_dir, exist_ok=True)
     logger = TrainingLogger(log_dir)
-    convergence_file = os.path.join(log_dir, f"convergence_metrics_{config['qos_required']}.json")
+    convergence_file = os.path.join(log_dir, f"convergence_metrics_qos_{config['qos_required']}_users_{config['num_users']}.json")
     
     # Training metrics
     episode_rewards = []
@@ -225,7 +226,7 @@ def train_agent(agent_name, config, train_config, device):
             agent.save_model(log_dir, id=episode)
 
         if episode % (train_config['save_frequency']) == 0:
-            with open(f"{log_dir}/training_metrics_{config['qos_required']}.json", 'w') as f:
+            with open(f"{log_dir}/training_metrics_qos_{config['qos_required']}_users_{config['num_users']}.json", 'w') as f:
                 json.dump(convert_numpy_to_list(training_metrics), f, indent=2)
             with open(convergence_file, 'w') as f:
                 json.dump(convert_numpy_to_list(convergence_metrics), f, indent=2)
@@ -235,7 +236,7 @@ def train_agent(agent_name, config, train_config, device):
     training_metrics['train_config'] = convert_numpy_to_list(train_config)
     training_metrics['agent_name'] = agent_name
     
-    with open(f"{log_dir}/training_metrics.json", 'w') as f:
+    with open(f"{log_dir}/training_metrics_qos_{config['qos_required']}_users_{config['num_users']}.json", 'w') as f:
         json.dump(convert_numpy_to_list(training_metrics), f, indent=2)
     with open(convergence_file, 'w') as f:
         json.dump(convert_numpy_to_list(convergence_metrics), f, indent=2)
@@ -293,12 +294,15 @@ def main():
     parser.add_argument('--print_frequency', type=int, default=10, help='Print frequency (episodes)')
     parser.add_argument('--save_frequency', type=int, default=100, help='Save frequency (episodes)')
     parser.add_argument('--device', type=str, default='auto', help='Device (cpu/cuda/auto)')
+    parser.add_argument('--qos_required', type=float, default=0.9, help='Required QoS level for the environment')
+    parser.add_argument('--num_users', type=int, default=10, help='Number of users in the environment')
+    parser.add_argument('--device_id', type=int, default=0, help='GPU device ID if using CUDA')
     
     args = parser.parse_args()
     
     # Set device
     if args.device == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        device = torch.device(f'cuda:{args.device_id}' if torch.cuda.is_available() else 'cpu')
     else:
         device = torch.device(args.device)
     
@@ -309,6 +313,9 @@ def main():
     
     # Environment configuration
     config = EnvConfig_v1("GAIServiceEnv")
+    
+    config['qos_required'] = args.qos_required
+    config['num_users'] = args.num_users
     
     # Training configuration
     train_config = {
@@ -425,7 +432,7 @@ def main():
         'timestamp': datetime.now().isoformat()
     }
     
-    with open('training_summary.json', 'w') as f:
+    with open(f'training_summary_qos_{config["qos_required"]}_users_{config["num_users"]}.json', 'w') as f:
         json.dump(summary, f, indent=2)
     
     print(f"\n{'='*50}")
@@ -435,7 +442,7 @@ def main():
         if 'metrics' in result:
             final_reward = np.mean(result['metrics']['episode_rewards'][-100:]) if result['metrics']['episode_rewards'] else 0
             print(f"{agent_name}: Final Avg Reward = {final_reward:.2f}")
-    print(f"Summary saved to: training_summary.json")
+    print(f"Summary saved to: training_summary_qos_{config['qos_required']}_users_{config['num_users']}.json")
 
 if __name__ == "__main__":
     main()

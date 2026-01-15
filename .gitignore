@@ -1,2 +1,4 @@
 logs/
 *.sh
+*.png
+*.json

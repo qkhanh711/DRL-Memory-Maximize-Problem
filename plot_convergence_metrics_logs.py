@@ -3,10 +3,17 @@ import json
 import os
 from pathlib import Path
 from typing import Dict, List, Tuple
-
+import argparse
 import matplotlib.pyplot as plt
 import numpy as np
 
+
+argparser = argparse.ArgumentParser(description="Plot convergence metrics (latency, QoS, memory, revenue) per episode")
+
+argparser.add_argument("--num_users", type=int, default=8, help="Number of users in the environment")
+argparser.add_argument("--qos_required", type=float, default=30.0, help="Required QoS level for the environment")
+
+args = argparser.parse_args()
 
 def smooth(values: List[float], window: int) -> np.ndarray:
     if window <= 1 or len(values) == 0:
@@ -17,7 +24,7 @@ def smooth(values: List[float], window: int) -> np.ndarray:
 
 
 def load_episode_metrics(run_dir: Path) -> Tuple[List[int], Dict[str, List[float]]]:
-    file_path = run_dir / "convergence_metrics.json"
+    file_path = run_dir / f"convergence_metrics_qos_{args.qos_required}_users_{args.num_users}.json"
     if not file_path.exists():
         return [], {}
     try:
@@ -70,7 +77,7 @@ def plot_run(run_name: str, episodes: List[int], metrics: Dict[str, List[float]]
         ax.set_xlim(0, max(episodes) if episodes else 1)
         ax.legend()
     plt.tight_layout()
-    save_path = output_dir / f"{run_name}_convergence.png"
+    save_path = output_dir / f"{run_name}_convergence_qos_{args.qos_required}_u{args.num_users}.png"
     plt.savefig(save_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {save_path}")
@@ -105,7 +112,7 @@ def plot_overlay(all_runs: Dict[str, Dict[str, List[float]]], episodes_map: Dict
         ax.set_xlim(0, max(max(episodes_map.get(rn, [0])) for rn in all_runs.keys()) if all_runs else 1)
         ax.legend()
         plt.tight_layout()
-        save_path = output_dir / f"convergence_{short}_overlay.png"
+        save_path = output_dir / f"convergence_{short}_overlay_qos_{args.qos_required}_u{args.num_users}.png"
         plt.savefig(save_path, dpi=200, bbox_inches="tight")
         plt.close(fig)
         print(f"Saved: {save_path}")

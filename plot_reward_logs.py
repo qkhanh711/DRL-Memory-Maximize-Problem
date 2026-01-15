@@ -3,9 +3,16 @@ import matplotlib.pyplot as plt
 import os
 from pathlib import Path
 import numpy as np
+import argparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--qos_required', type=float, default=25.0, help='Required QoS level for the environment')
+parser.add_argument('--num_users', type=int, default=10, help='Number of users in the environment')
+
+args = parser.parse_args()
 
 # Path to logs directory
-logs_dir = Path("/home/khanhnq/New-DRL-Memory-Maximize-Problem/logs")
+logs_dir = Path("/home/khanhnq/test/DRL-Memory-Maximize-Problem/logs")
 
 # Collect data from all training runs
 training_data = {}
@@ -13,7 +20,7 @@ training_data = {}
 for folder in sorted(logs_dir.iterdir()):
 
     if folder.is_dir():
-        metrics_file = folder / "training_metrics_8.json"
+        metrics_file = folder / f"training_metrics_qos_{float(args.qos_required)}_users_{args.num_users}.json"
         print(f"Loading metrics from: {metrics_file}")
         if metrics_file.exists():
             with open(metrics_file, 'r') as f:
@@ -65,7 +72,7 @@ if training_data:
     plt.tight_layout()
     
     # Save figure
-    output_path = logs_dir.parent / "reward_plot_all_runs.png"
+    output_path = logs_dir.parent / f"reward_plot_all_runs_qos_{args.qos_required}_u{args.num_users}.png"
     plt.savefig(output_path, dpi=100, bbox_inches='tight')
     print(f"\n✓ Saved plot to: {output_path}")
     
@@ -78,7 +85,7 @@ if training_data:
         episodes = range(len(rewards))
         
         # Plot moving average for cleaner view
-        window = min(100, len(rewards) // 10)
+        window = min(500, len(rewards) // 10)
         if window > 1:
             moving_avg = np.convolve(rewards, np.ones(window)/window, mode='valid')
             moving_episodes = range(window-1, len(rewards))
@@ -95,7 +102,7 @@ if training_data:
     plt.tight_layout()
     
     # Save combined plot
-    combined_path = logs_dir.parent / "reward_plot_combined.png"
+    combined_path = logs_dir.parent / f"reward_plot_combined_qos_{args.qos_required}_u{args.num_users}.png"
     plt.savefig(combined_path, dpi=100, bbox_inches='tight')
     # print(f"✓ Saved combined plot to: {combined_path}")
     
