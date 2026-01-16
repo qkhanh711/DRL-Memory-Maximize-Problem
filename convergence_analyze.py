@@ -102,6 +102,7 @@ def evaluate_agent_performance(agent_name: str, num_users: int, device, episodes
 
     episode_rewards, episode_lengths = [], []
     memory_usage, latency_values, qos_values, denoise_steps = [], [], [], []
+    revenue_values = []
     total_flops_values = []
 
     total_steps = 0
@@ -142,6 +143,7 @@ def evaluate_agent_performance(agent_name: str, num_users: int, device, episodes
             lats = per_user.get('latency', [])
             qoss = per_user.get('qos', [])
             steps = per_user.get('steps', [])
+            prices = per_user.get('price', [])
 
             # Indices/users that were actually served
             served_indices = [i for i, s in enumerate(serves) if s > 0]
@@ -155,11 +157,14 @@ def evaluate_agent_performance(agent_name: str, num_users: int, device, episodes
                 qos_values.append(float(np.mean([qoss[i] for i in served_indices])))
                 # Denoise steps: average among served users
                 denoise_steps.append(float(np.mean([steps[i] for i in served_indices])))
+                # Revenue: average among served users
+                revenue_values.append(float(np.mean([prices[i] for i in served_indices])))
             else:
                 memory_usage.append(0.0)
                 latency_values.append(0.0)
                 qos_values.append(0.0)
                 denoise_steps.append(0.0)
+                revenue_values.append(0.0)
 
         # Track total FLOPs if provided by env
         total_flops_values.append(float(info.get('total_flops', 0)))
@@ -174,11 +179,13 @@ def evaluate_agent_performance(agent_name: str, num_users: int, device, episodes
         'latency': latency_values,
         'qos': qos_values,
         'denoise_steps': denoise_steps,
+        'revenue': revenue_values,
         'final_reward': np.mean(episode_rewards[-10:]) if len(episode_rewards) >= 10 else np.mean(episode_rewards) if episode_rewards else 0,
         'avg_memory': np.mean(memory_usage) if memory_usage else 0,
         'avg_latency': np.mean(latency_values) if latency_values else 0,
         'avg_qos': np.mean(qos_values) if qos_values else 0,
         'avg_denoise_steps': np.mean(denoise_steps) if denoise_steps else 0,
+        'avg_revenue': np.mean(revenue_values) if revenue_values else 0,
         'avg_total_flops': np.mean(total_flops_values) if total_flops_values else 0,
     }
 
@@ -221,6 +228,7 @@ def create_comparison_table(results_by_users: Dict[int, Dict[str, Any]], save_pa
                 'Avg_Latency': metrics.get('avg_latency', 0),
                 'Avg_QoS': metrics.get('avg_qos', 0),
                 'Avg_Denoise_Steps': metrics.get('avg_denoise_steps', 0),
+                'Avg_Revenue': metrics.get('avg_revenue', 0),
             })
     df = pd.DataFrame(data_rows)
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
@@ -304,6 +312,20 @@ def plot_users_analysis(results_by_users: Dict[int, Dict[str, Any]], save_dir: s
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
     plt.savefig(f'{save_dir}/denoise_steps_vs_users.png', dpi=300, bbox_inches='tight')
+    plt.show()
+
+    # Revenue vs Users
+    plt.figure(figsize=(10, 6))
+    for agent_name in agent_names:
+        revenue = [results_by_users[users][agent_name]['avg_revenue'] for users in user_counts]
+        plt.plot(user_counts, revenue, marker='*', label=agent_name, linewidth=2, markersize=10)
+    plt.title('Average Revenue vs Number of Users', fontsize=14, fontweight='bold')
+    plt.xlabel('Number of Users')
+    plt.ylabel('Average Revenue')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/revenue_vs_users.png', dpi=300, bbox_inches='tight')
     plt.show()
 
     # Save table

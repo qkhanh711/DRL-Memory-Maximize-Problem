@@ -147,6 +147,7 @@ def evaluate_agent_performance(agent_name, num_users, device, episodes=50, max_s
     latency_values = []
     qos_values = []
     denoise_steps = []
+    revenue_values = []
     
     # Training loop
     total_steps = 0
@@ -202,6 +203,8 @@ def evaluate_agent_performance(agent_name, num_users, device, episodes=50, max_s
                 qos_values.append(np.mean(per_user['qos']))
             if per_user['steps']:
                 denoise_steps.append(np.mean(per_user['steps']))
+            if per_user['price']:
+                revenue_values.append(np.mean(per_user['price']))
         
         if episode % 10 == 0:
             print(f"  Episode {episode}, Reward: {episode_reward:.2f}")
@@ -213,11 +216,13 @@ def evaluate_agent_performance(agent_name, num_users, device, episodes=50, max_s
         'latency': latency_values,
         'qos': qos_values,
         'denoise_steps': denoise_steps,
+        'revenue': revenue_values,
         'final_reward': np.mean(episode_rewards[-10:]) if len(episode_rewards) >= 10 else np.mean(episode_rewards),
         'avg_memory': np.mean(memory_usage) if memory_usage else 0,
         'avg_latency': np.mean(latency_values) if latency_values else 0,
         'avg_qos': np.mean(qos_values) if qos_values else 0,
         'avg_denoise_steps': np.mean(denoise_steps) if denoise_steps else 0,
+        'avg_revenue': np.mean(revenue_values) if revenue_values else 0,
     }
 
 def plot_convergence_rewards(results, save_path='convergence_rewards.png'):
@@ -334,7 +339,22 @@ def plot_users_analysis(results_by_users, save_dir='analysis_plots'):
     plt.savefig(f'{save_dir}/denoise_steps_vs_users.png', dpi=300, bbox_inches='tight')
     plt.show()
     
-    # 6. Comprehensive comparison table
+    # 6. Revenue vs Number of Users
+    plt.figure(figsize=(10, 6))
+    for agent_name in agent_names:
+        revenue = [results_by_users[users][agent_name]['avg_revenue'] for users in user_counts]
+        plt.plot(user_counts, revenue, marker='*', label=agent_name, linewidth=2, markersize=10)
+    
+    plt.title('Average Revenue vs Number of Users', fontsize=14, fontweight='bold')
+    plt.xlabel('Number of Users')
+    plt.ylabel('Average Revenue')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/revenue_vs_users.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # 7. Comprehensive comparison table
     create_comparison_table(results_by_users, f'{save_dir}/comprehensive_analysis.csv')
     
     print(f"All analysis plots saved to: {save_dir}/")
@@ -352,7 +372,8 @@ def create_comparison_table(results_by_users, save_path):
                 'Avg_Memory': metrics['avg_memory'],
                 'Avg_Latency': metrics['avg_latency'],
                 'Avg_QoS': metrics['avg_qos'],
-                'Avg_Denoise_Steps': metrics['avg_denoise_steps']
+                'Avg_Denoise_Steps': metrics['avg_denoise_steps'],
+                'Avg_Revenue': metrics['avg_revenue']
             })
     
     df = pd.DataFrame(data)
@@ -448,6 +469,7 @@ def main():
                             'Avg_Latency': m.get('avg_latency', 0),
                             'Avg_QoS': m.get('avg_qos', 0),
                             'Avg_Denoise_Steps': m.get('avg_denoise_steps', 0),
+                            'Avg_Revenue': m.get('avg_revenue', 0),
                         })
             if rows:
                 df = pd.DataFrame(rows)

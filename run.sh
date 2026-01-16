@@ -3,32 +3,117 @@
 set -euo pipefail
 
 echo "============================================================"
-echo "Run convergence_analyze.py with passed or shortcut commands"
+echo "Run training and plot metrics for DRL models"
 echo "============================================================"
 
+# Default configuration for 4 models: DiffPPO, DiffQL, PPO, DQL
+AGENTS="ppo_diffusion ql_diffusion gaussian_ppo gaussian_dql"
+EPISODES=1000
+MAX_STEPS=100000
+NUM_USERS=10
+SEED=42
+QOS_TARGETS="25 30 35"
+USER_COUNTS="8 10 12"
+
 # Shortcuts:
-#   bash run.sh analyze [extra args]            -> --run_performance
-#   bash run.sh convergence [extra args]        -> --run_convergence
-#   bash run.sh replot-analyze [extra args]     -> --replot --run_performance
-#   bash run.sh replot-convergence [extra args] -> --replot --run_convergence
-#   bash run.sh dashboard [extra args]          -> --run_dashboard
+#   bash run.sh train              -> Train all 4 models (convergence analysis)
+#   bash run.sh analyze            -> Performance analysis across user counts
+#   bash run.sh qos-sweep          -> QoS sweep analysis
+#   bash run.sh full               -> Complete training and analysis pipeline
+#   bash run.sh convergence        -> Custom convergence run
+#   bash run.sh replot-analyze     -> Replot analysis only
+#   bash run.sh replot-convergence -> Replot convergence only
+#   bash run.sh dashboard          -> Dashboard view
 
 CMD_ARGS=("$@")
 
 if [ ${#CMD_ARGS[@]} -eq 0 ] || [ "${CMD_ARGS[0]}" = "help" ]; then
 	echo "Usage:"
-	echo "  bash run.sh analyze [--user_counts 8 10 12] [--episodes 50] [--max_steps 1000]"
-	echo "  bash run.sh convergence [--agents ...] [--num_users 10] [--episodes 100] [--max_steps 2000] [--save_dir convergence_plots]"
-	echo "  bash run.sh replot-analyze"
-	echo "  bash run.sh replot-convergence [--save_dir convergence_plots]"
-	echo "  bash run.sh dashboard"
-	echo "  bash run.sh [direct args to convergence_analyze.py]"
+	echo ""
+	echo "Quick Commands:"
+	echo "  bash run.sh train              - Train 4 models (DiffPPO, DiffQL, PPO, DQL) with convergence plots"
+	echo "  bash run.sh analyze            - Performance analysis across different user counts (8, 10, 12)"
+	echo "  bash run.sh qos-sweep          - QoS target sweep analysis (25, 30, 35)"
+	echo "  bash run.sh full               - Run complete pipeline (train + analyze + qos-sweep)"
+	echo ""
+	echo "Advanced Commands:"
+	echo "  bash run.sh convergence [opts] - Custom convergence training"
+	echo "  bash run.sh replot-analyze     - Replot performance analysis from saved data"
+	echo "  bash run.sh replot-convergence - Replot convergence from saved data"
+	echo "  bash run.sh dashboard          - Show training dashboard"
+	echo ""
+	echo "Options:"
+	echo "  --agents <list>         - Space-separated agent names (default: $AGENTS)"
+	echo "  --episodes <n>          - Number of episodes (default: $EPISODES)"
+	echo "  --max_steps <n>         - Max steps per run (default: $MAX_STEPS)"
+	echo "  --num_users <n>         - Number of users for convergence (default: $NUM_USERS)"
+	echo "  --seed <n>              - Random seed (default: $SEED)"
+	echo ""
+	echo "Example:"
+	echo "  bash run.sh train --episodes 500 --max_steps 50000"
+	exit 0
 fi
 
 # Map shortcuts to full arguments
 case "${CMD_ARGS[0]:-}" in
+	train)
+		echo "=========================================="
+		echo "Training 4 models: DiffPPO, DiffQL, PPO, DQL"
+		echo "=========================================="
+		CMD_ARGS=("--run_convergence" "--agents" $AGENTS "--num_users" "$NUM_USERS" 
+		          "--episodes" "$EPISODES" "--max_steps" "$MAX_STEPS" 
+		          "--save_dir" "convergence_plots" "--seed" "$SEED" "${CMD_ARGS[@]:1}")
+		;;
 	analyze)
-		CMD_ARGS=("--run_performance" "${CMD_ARGS[@]:1}")
+		echo "=========================================="
+		echo "Performance analysis across user counts"
+		echo "=========================================="
+		CMD_ARGS=("--run_performance" "--agents" $AGENTS "--user_counts" $USER_COUNTS 
+		          "--episodes" "$EPISODES" "--max_steps" "$MAX_STEPS" "--seed" "$SEED" "${CMD_ARGS[@]:1}")
+		;;
+	qos-sweep)
+		echo "=========================================="
+		echo "QoS target sweep analysis"
+		echo "=========================================="
+		mkdir -p final_plot
+		python scripts/analyze_performance.py --agents $AGENTS \
+		  --qos_requireds $QOS_TARGETS --user_counts $USER_COUNTS \
+		  --episodes 100 --max_steps 10000 --device auto --seed $SEED "${CMD_ARGS[@]:1}"
+		move_dir "analysis_plots"
+		echo "QoS sweep complete!"
+		exit 0
+		;;
+	full)
+		echo "=========================================="
+		echo "Running complete pipeline"
+		echo "=========================================="
+		# 1. Training with convergence
+		echo ""
+		echo "[1/3] Training models..."
+		python convergence_analyze.py --run_convergence --agents $AGENTS \
+		  --num_users $NUM_USERS --episodes $EPISODES --max_steps $MAX_STEPS \
+		  --save_dir convergence_plots --seed $SEED
+		
+		# 2. Performance analysis
+		echo ""
+		echo "[2/3] Performance analysis..."
+		python convergence_analyze.py --run_performance --agents $AGENTS \
+		  --user_counts $USER_COUNTS --episodes $EPISODES --max_steps $MAX_STEPS --seed $SEED
+		
+		# 3. QoS sweep
+		echo ""
+		echo "[3/3] QoS sweep analysis..."
+		python scripts/analyze_performance.py --agents $AGENTS \
+		  --qos_requireds $QOS_TARGETS --user_counts $USER_COUNTS \
+		  --episodes 100 --max_steps 10000 --device auto --seed $SEED
+		
+		# Organize results
+		mkdir -p final_plot
+		move_dir "convergence_plots"
+		move_dir "analysis_plots"
+		echo ""
+		echo "Complete pipeline finished! Results in final_plot/"
+		exit 0
 		;;
 	convergence)
 		CMD_ARGS=("--run_convergence" "${CMD_ARGS[@]:1}")

@@ -144,6 +144,7 @@ def collect_convergence_data(agent_name, num_users, device, episodes=100, max_st
         'latency': [],
         'qos': [],
         'denoise_steps': [],
+        'revenue': [],
         'served_users': [],
         'total_latency': [],
         'total_memory': [],
@@ -204,18 +205,21 @@ def collect_convergence_data(agent_name, num_users, device, episodes=100, max_st
                 avg_latency = np.mean([l for l, s in zip(per_user['latency'], per_user['serve']) if s > 0])
                 avg_qos = np.mean([q for q, s in zip(per_user['qos'], per_user['serve']) if s > 0])
                 avg_denoise_steps = np.mean([d for d, s in zip(per_user['steps'], per_user['serve']) if s > 0])
+                avg_revenue = np.mean([p for p, s in zip(per_user['price'], per_user['serve']) if s > 0])
                 served_count = sum(per_user['serve'])
             else:
                 avg_memory = 0
                 avg_latency = 0
                 avg_qos = 0
                 avg_denoise_steps = 0
+                avg_revenue = 0
                 served_count = 0
         else:
             avg_memory = 0
             avg_latency = 0
             avg_qos = 0
             avg_denoise_steps = 0
+            avg_revenue = 0
             served_count = 0
         
         # Store convergence data
@@ -225,6 +229,7 @@ def collect_convergence_data(agent_name, num_users, device, episodes=100, max_st
         convergence_data['latency'].append(avg_latency)
         convergence_data['qos'].append(avg_qos)
         convergence_data['denoise_steps'].append(avg_denoise_steps)
+        convergence_data['revenue'].append(avg_revenue)
         convergence_data['served_users'].append(served_count)
         
         # Store system-level metrics
@@ -346,17 +351,16 @@ def plot_convergence_metrics(convergence_data, agent_name, save_dir='convergence
     ax8.legend()
     ax8.grid(True, alpha=0.3)
     
-    # 9. Reward distribution
+    # 9. Revenue convergence
     ax9 = axes[2, 2]
-    ax9.hist(convergence_data['rewards'], bins=20, alpha=0.7, color='skyblue', edgecolor='black')
-    ax9.axvline(np.mean(convergence_data['rewards']), color='red', linestyle='--', 
-                linewidth=2, label=f'Mean: {np.mean(convergence_data["rewards"]):.0f}')
-    ax9.axvline(np.median(convergence_data['rewards']), color='orange', linestyle='--', 
-                linewidth=2, label=f'Median: {np.median(convergence_data["rewards"]):.0f}')
-    ax9.set_title('Reward Distribution')
-    ax9.set_xlabel('Reward')
-    ax9.set_ylabel('Frequency')
-    ax9.legend()
+    ax9.plot(episodes, convergence_data['revenue'], 'gold', linewidth=2, alpha=0.7)
+    if window_size > 1:
+        moving_avg = np.convolve(convergence_data['revenue'], np.ones(window_size)/window_size, mode='valid')
+        ax9.plot(episodes[window_size-1:], moving_avg, 'r-', linewidth=3, label=f'MA({window_size})')
+        ax9.legend()
+    ax9.set_title('Revenue Convergence')
+    ax9.set_xlabel('Episode')
+    ax9.set_ylabel('Average Revenue')
     ax9.grid(True, alpha=0.3)
     
     plt.tight_layout()
