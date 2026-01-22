@@ -2,3 +2,4 @@ logs/
 *.sh
 *.png
 *.json
+__pycache__/

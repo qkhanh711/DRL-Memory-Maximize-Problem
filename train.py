@@ -70,7 +70,7 @@ def create_agent(agent_name, state_dim, action_dim, max_action, device, **kwargs
         **kwargs
     )
 
-def train_agent(agent_name, config, train_config, device):
+def train_agent(agent_name, config, train_config, device, seed = 42):
     """Train a single agent"""
     print(f"\n{'='*50}")
     print(f"Training {agent_name}")
@@ -90,7 +90,7 @@ def train_agent(agent_name, config, train_config, device):
     
     # Create logger
     # log_dir = f"logs/{agent_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    log_dir = f"logs/{agent_name}"
+    log_dir = f"logs/{seed}/{agent_name}"
     os.makedirs(log_dir, exist_ok=True)
     logger = TrainingLogger(log_dir)
     convergence_file = os.path.join(log_dir, f"convergence_metrics_qos_{config['qos_required']}_users_{config['num_users']}.json")
@@ -296,13 +296,16 @@ def main():
     parser.add_argument('--device', type=str, default='auto', help='Device (cpu/cuda/auto)')
     parser.add_argument('--qos_required', type=float, default=0.9, help='Required QoS level for the environment')
     parser.add_argument('--num_users', type=int, default=10, help='Number of users in the environment')
-    parser.add_argument('--device_id', type=int, default=0, help='GPU device ID if using CUDA')
+    parser.add_argument('--device_id', type=int, default=None, help='GPU device ID if using CUDA')
     
     args = parser.parse_args()
     
     # Set device
     if args.device == 'auto':
-        device = torch.device(f'cuda:{args.device_id}' if torch.cuda.is_available() else 'cpu')
+        if args.device_id != None:
+            device = torch.device(f'cuda:{args.device_id}' if torch.cuda.is_available() else 'cpu')
+        else:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     else:
         device = torch.device(args.device)
     
@@ -317,9 +320,10 @@ def main():
     config['qos_required'] = args.qos_required
     config['num_users'] = args.num_users
     
+    seed = args.seed
     # Training configuration
     train_config = {
-        'seed': args.seed,
+        'seed': seed,
         'max_steps': args.max_steps,
         'max_episode_length': args.max_episode_length,
         'buffer_size': args.buffer_size,
@@ -387,7 +391,7 @@ def main():
             'agent_params': {
                 'discount': 0.99,
                 'tau': 0.005,
-                'n_timesteps': 100,
+                'n_timesteps': 10,
                 'ema_decay': 0.995,
                 'lr': 3e-4,
                 'grad_norm': 1.0,
@@ -402,38 +406,53 @@ def main():
     else:
         agents_to_train = [args.agent]
     
+    
     # Train agents
     all_results = {}
-    from tqdm.notebook import tnrange
-    for i in tnrange(len(agents_to_train), desc="Agents Training"):
-        agent_name = agents_to_train[i]
-        try:
-            # Update train_config with agent-specific parameters
-            current_train_config = train_config.copy()
-            if agent_name in agent_configs:
-                current_train_config.update(agent_configs[agent_name])
-            
-            # Train agent
-            metrics, log_dir = train_agent(agent_name, config, current_train_config, device)
-            all_results[agent_name] = {
-                'metrics': metrics,
-                'log_dir': log_dir
-            }
-            
-        except Exception as e:
-            print(f"Error training {agent_name}: {e}")
-            continue
-    
+    from tqdm import tqdm
+    if (len(agents_to_train) > 1):
+        for i in tqdm(len(agents_to_train), desc="Agents Training"):
+            agent_name = agents_to_train[i]
+            try:
+                # Update train_config with agent-specific parameters
+                current_train_config = train_config.copy()
+                if agent_name in agent_configs:
+                    current_train_config.update(agent_configs[agent_name])
+
+                # Train agent
+                metrics, log_dir = train_agent(agent_name, config, current_train_config, device, seed)
+                all_results[agent_name] = {
+                    'metrics': metrics,
+                    'log_dir': log_dir
+                }
+
+            except Exception as e:
+                print(f"Error training {agent_name}: {e}")
+                continue
+    else:
+        agent_name = agents_to_train[0]
+        # Update train_config with agent-specific parameters
+        current_train_config = train_config.copy()
+        if agent_name in agent_configs:
+            current_train_config.update(agent_configs[agent_name])
+
+        # Train agent
+        metrics, log_dir = train_agent(agent_name, config, current_train_config, device, seed)
+        all_results[agent_name] = {
+            'metrics': metrics,
+            'log_dir': log_dir
+        }
+
     # Save summary results
-    summary = {
-        'config': convert_numpy_to_list(config),
-        'train_config': convert_numpy_to_list(train_config),
-        'results': convert_numpy_to_list(all_results),
-        'timestamp': datetime.now().isoformat()
-    }
+    # summary = {
+    #     'config': convert_numpy_to_list(config),
+    #     'train_config': convert_numpy_to_list(train_config),
+    #     'results': convert_numpy_to_list(all_results),
+    #     'timestamp': datetime.now().isoformat()
+    # }
     
-    with open(f'training_summary_qos_{config["qos_required"]}_users_{config["num_users"]}.json', 'w') as f:
-        json.dump(summary, f, indent=2)
+    # with open(f'logs/training_summary_qos_{config["qos_required"]}_users_{config["num_users"]}.json', 'w') as f:
+        # json.dump(summary, f, indent=2)
     
     print(f"\n{'='*50}")
     print("Training Summary")

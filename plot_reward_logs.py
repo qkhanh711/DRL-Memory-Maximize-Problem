@@ -8,11 +8,15 @@ import argparse
 parser = argparse.ArgumentParser()
 parser.add_argument('--qos_required', type=float, default=25.0, help='Required QoS level for the environment')
 parser.add_argument('--num_users', type=int, default=10, help='Number of users in the environment')
-
+parser.add_argument('--seed', type=int, default=None, help='Seed')
 args = parser.parse_args()
 
+seed = args.seed
 # Path to logs directory
-logs_dir = Path("/home/khanhnq/test/DRL-Memory-Maximize-Problem/logs")
+if seed == None:
+    logs_dir = Path("/home/n2tp/projects/Khanh_stuff/DRL-Memory-Maximize-Problem/logs")
+else:
+    logs_dir = Path(f"/home/n2tp/projects/Khanh_stuff/DRL-Memory-Maximize-Problem/logs/{seed}")
 
 # Collect data from all training runs
 training_data = {}
@@ -41,40 +45,40 @@ if training_data:
         axes = [axes]
     
     # Plot each training run
-    for idx, (name, rewards) in enumerate(training_data.items()):
-        ax = axes[idx]
+    # for idx, (name, rewards) in enumerate(training_data.items()):
+    #     ax = axes[idx]
         
-        # Plot raw rewards
-        episodes = range(len(rewards))
-        ax.plot(episodes, rewards, linewidth=0.8, alpha=0.7, label='Episode Reward')
+    #     # Plot raw rewards
+    #     episodes = range(len(rewards))
+    #     ax.plot(episodes, rewards, linewidth=0.8, alpha=0.7, label='Episode Reward')
         
-        # Add moving average (window=100)
-        window = min(100, len(rewards) // 10)
-        if window > 1:
-            moving_avg = np.convolve(rewards, np.ones(window)/window, mode='valid')
-            moving_episodes = range(window-1, len(rewards))
-            ax.plot(moving_episodes, moving_avg, linewidth=2, color='red', label=f'Moving Avg (window={window})')
+    #     # Add moving average (window=100)
+    #     window = min(100, len(rewards) // 10)
+    #     if window > 1:
+    #         moving_avg = np.convolve(rewards, np.ones(window)/window, mode='valid')
+    #         moving_episodes = range(window-1, len(rewards))
+    #         ax.plot(moving_episodes, moving_avg, linewidth=2, color='red', label=f'Moving Avg (window={window})')
         
-        # Stats
-        mean_reward = np.mean(rewards)
-        max_reward = np.max(rewards)
-        min_reward = np.min(rewards)
+    #     # Stats
+    #     mean_reward = np.mean(rewards)
+    #     max_reward = np.max(rewards)
+    #     min_reward = np.min(rewards)
         
-        ax.axhline(y=mean_reward, color='green', linestyle='--', linewidth=1.5, alpha=0.7, label=f'Mean: {mean_reward:.2f}')
+    #     ax.axhline(y=mean_reward, color='green', linestyle='--', linewidth=1.5, alpha=0.7, label=f'Mean: {mean_reward:.2f}')
         
-        ax.set_xlabel('Episode')
-        ax.set_ylabel('Reward')
-        ax.set_title(f'{name}\n(Mean: {mean_reward:.2f}, Max: {max_reward:.2f}, Min: {min_reward:.2f})')
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc='best')
-        ax.set_xlim(0, len(rewards))
+    #     ax.set_xlabel('Episode')
+    #     ax.set_ylabel('Reward')
+    #     ax.set_title(f'{name}\n(Mean: {mean_reward:.2f}, Max: {max_reward:.2f}, Min: {min_reward:.2f})')
+    #     ax.grid(True, alpha=0.3)
+    #     ax.legend(loc='best')
+    #     ax.set_xlim(0, len(rewards))
     
-    plt.tight_layout()
+    # plt.tight_layout()
     
     # Save figure
-    output_path = logs_dir.parent / f"reward_plot_all_runs_qos_{args.qos_required}_u{args.num_users}.png"
-    plt.savefig(output_path, dpi=100, bbox_inches='tight')
-    print(f"\n✓ Saved plot to: {output_path}")
+    # output_path = logs_dir.parent / f"reward_plot_all_runs_qos_{args.qos_required}_u{args.num_users}.png"
+    # plt.savefig(output_path, dpi=100, bbox_inches='tight')
+    # print(f"\n✓ Saved plot to: {output_path}")
     
     # Create combined plot
     fig2, ax2 = plt.subplots(figsize=(14, 7))
@@ -102,9 +106,14 @@ if training_data:
     plt.tight_layout()
     
     # Save combined plot
-    combined_path = logs_dir.parent / f"reward_plot_combined_qos_{args.qos_required}_u{args.num_users}.png"
+    print(logs_dir, logs_dir.parent, sep="\n")
+
+    save_figs_dir = logs_dir.parent / "save_figs" / f"{seed}"
+    save_figs_dir.mkdir(exist_ok=True)
+
+    combined_path = save_figs_dir / f"reward_plot_combined_qos_{args.qos_required}_u{args.num_users}.png"
     plt.savefig(combined_path, dpi=100, bbox_inches='tight')
-    # print(f"✓ Saved combined plot to: {combined_path}")
+    print(f"✓ Saved combined plot to: {combined_path}")
     
     # Print statistics
     # print("\n" + "="*60)
