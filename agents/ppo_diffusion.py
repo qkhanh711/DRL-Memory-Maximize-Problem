@@ -58,6 +58,7 @@ class Diffusion_PPO(object):
                  entropy_coef=0.02,  # Higher entropy for more exploration
                  value_loss_coef=0.25,  # Lower value loss weight
                  warmup_steps=200,  # Shorter warmup
+                 beta_diffusion=0.5,  # Weight for diffusion loss
                  ):
 
         self.model = MLP(state_dim=state_dim, action_dim=action_dim, device=device)
@@ -66,6 +67,9 @@ class Diffusion_PPO(object):
                                beta_schedule=beta_schedule, n_timesteps=n_timesteps,).to(device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr, betas=(0.9, 0.999), eps=1e-8)
 
+        # Initialize old policy for PPO ratio computation
+        self.actor_old = copy.deepcopy(self.actor)
+        
         self.lr_decay = lr_decay
         self.grad_norm = grad_norm
 
@@ -85,6 +89,7 @@ class Diffusion_PPO(object):
 
         self.entropy_coef = entropy_coef
         self.value_coef = value_loss_coef
+        self.beta_diffusion = beta_diffusion
         self.initial_lr = lr
         self.state_dim = state_dim
         self.max_action = max_action
@@ -100,68 +105,152 @@ class Diffusion_PPO(object):
         self.ema.update_model_average(self.ema_model, self.actor)
 
 
+    def compute_gae(self, rewards, values, next_values, not_dones):
+        """
+        Compute Generalized Advantage Estimation (GAE)
+        A_t = sum_{l=0}^{inf} (gamma * lambda)^l * delta_{t+l}
+        where delta_t = r_t + gamma * V(s_{t+1}) - V(s_t)
+        """
+        advantages = torch.zeros_like(rewards)
+        last_advantage = 0
+        
+        # Compute GAE backwards
+        for t in reversed(range(len(rewards))):
+            delta = rewards[t] + self.gamma * next_values[t] * not_dones[t] - values[t]
+            # Clamp delta to prevent explosion
+            delta = torch.clamp(delta, -10.0, 10.0)
+            advantages[t] = last_advantage = delta + self.gamma * self.tau * not_dones[t] * last_advantage
+        
+        returns = advantages + values
+        return advantages, returns
+
+    def compute_ppo_loss(self, state, action, advantages):
+        """
+        Compute PPO clipped loss with diffusion policy
+        """
+        # Get log prob from current policy (using diffusion loss as proxy)
+        current_loss = self.actor.loss(action, state)
+        
+        # Get log prob from old policy
+        with torch.no_grad():
+            old_loss = self.actor_old.loss(action, state)
+        
+        # Compute ratio: pi(a|s) / pi_old(a|s)
+        # Since we use loss (negative log prob), ratio = exp(old_loss - current_loss)
+        # Clamp the exponent to prevent overflow/underflow
+        log_ratio = torch.clamp(old_loss - current_loss, -20.0, 20.0)
+        ratio = torch.exp(log_ratio)
+        
+        # Check for NaN and replace with 1.0 (no change)
+        ratio = torch.where(torch.isnan(ratio), torch.ones_like(ratio), ratio)
+        ratio = torch.clamp(ratio, 0.1, 10.0)  # Prevent extreme ratios
+        
+        # Clipped surrogate loss
+        surr1 = ratio * advantages
+        surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * advantages
+        ppo_loss = -torch.min(surr1, surr2).mean()
+        
+        return ppo_loss, ratio
+
     def train(self, replay_buffer, iterations, batch_size=100, log_writer=None):
-        metric = {'ppo_loss': [], 'value_loss': [], 'actor_loss': []}
+        metric = {'ppo_loss': [], 'value_loss': [], 'actor_loss': [], 'diffusion_loss': []}
         
         for iteration in range(iterations):
             try:
-                # Sample batch
+                # ============================================
+                # Trajectory Collection: Sample batch
+                # ============================================
                 state, action, next_state, reward, not_done = replay_buffer.sample(batch_size)
 
-                """ Value Function Training (Train first for stable baseline) """
+                # ============================================
+                # Value Function Update (train first for stable baseline)
+                # ============================================
                 with torch.no_grad():
                     next_values = self.critic(next_state).squeeze()
                     returns = reward.squeeze() + self.gamma * next_values * not_done.squeeze()
                 
-                values = self.critic(state).squeeze()
-                advantages = returns - values
-                
-                # Normalize advantages
-                if advantages.std() > 1e-8:
-                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                
                 # Train value function multiple times
+                value_loss = None
                 for _ in range(3):
                     value_pred = self.critic(state).squeeze()
                     value_loss = F.mse_loss(value_pred, returns.detach())
+                    
+                    if torch.isnan(value_loss) or torch.isinf(value_loss):
+                        print(f"Warning: Invalid value loss at iteration {iteration}, skipping")
+                        break
                     
                     self.critic_optimizer.zero_grad()
                     value_loss.backward()
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), self.grad_norm)
                     self.critic_optimizer.step()
 
-                """ Policy Training - Advantage-Weighted Behavior Cloning """
-                # Only train on actions with positive advantages (good actions)
-                positive_mask = advantages > 0
+                # Skip if value training failed
+                if value_loss is None or torch.isnan(value_loss) or torch.isinf(value_loss):
+                    metric['ppo_loss'].append(0.0)
+                    metric['diffusion_loss'].append(0.0)
+                    metric['value_loss'].append(0.0)
+                    metric['actor_loss'].append(0.0)
+                    continue
+
+                # ============================================
+                # Advantage Estimation: Compute GAE
+                # ============================================
+                with torch.no_grad():
+                    values = self.critic(state).squeeze()
+                    next_values = self.critic(next_state).squeeze()
+                    
+                    # Compute advantages using GAE
+                    advantages, returns = self.compute_gae(
+                        reward.squeeze(), 
+                        values, 
+                        next_values, 
+                        not_done.squeeze()
+                    )
+                    
+                    # Normalize advantages for stability
+                    if advantages.std() > 1e-8:
+                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                    else:
+                        advantages = advantages - advantages.mean()
+
+                # ============================================
+                # Policy Update (Diffusion Actor with PPO)
+                # ============================================
                 
-                if positive_mask.sum() > 0:  # Only if we have positive advantages
-                    # Get subset of good transitions
-                    good_states = state[positive_mask]
-                    good_actions = action[positive_mask]
-                    good_advantages = advantages[positive_mask]
-                    
-                    # Weight by advantage magnitude (higher advantage = more important)
-                    weights = torch.softmax(good_advantages, dim=0)  # Softmax to normalize
-                    
-                    # Compute weighted behavioral cloning loss
-                    bc_losses = self.actor.loss(good_actions, good_states)
-                    weighted_bc_loss = (bc_losses * weights.detach()).mean()
-                    
-                    # Add small regularization
-                    reg_loss = 0.001 * bc_losses.mean()
-                    total_actor_loss = weighted_bc_loss + reg_loss
-                    
-                    # Policy update
-                    self.actor_optimizer.zero_grad()
-                    total_actor_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_norm)
-                    self.actor_optimizer.step()
-                    
-                    policy_loss = weighted_bc_loss
+                # Compute diffusion behavior cloning loss
+                diffusion_loss = self.actor.loss(action, state)
+                
+                if torch.isnan(diffusion_loss).any() or torch.isinf(diffusion_loss).any():
+                    print(f"Warning: Invalid diffusion loss at iteration {iteration}, skipping policy update")
+                    metric['ppo_loss'].append(0.0)
+                    metric['diffusion_loss'].append(0.0)
+                    metric['value_loss'].append(float(value_loss.item()))
+                    metric['actor_loss'].append(0.0)
+                    continue
+                
+                # Compute PPO clipped loss
+                ppo_loss, ratio = self.compute_ppo_loss(state, action, advantages.detach())
+                
+                if torch.isnan(ppo_loss) or torch.isinf(ppo_loss):
+                    print(f"Warning: Invalid PPO loss at iteration {iteration}, using diffusion loss only")
+                    # Fall back to diffusion loss only
+                    total_actor_loss = diffusion_loss.mean()
+                    ppo_loss = torch.tensor(0.0)
                 else:
-                    # No positive advantages, skip policy update
-                    policy_loss = torch.tensor(0.0)
-                    total_actor_loss = torch.tensor(0.0)
+                    # Total actor loss: L_actor = L_PPO + beta * L_diffusion
+                    total_actor_loss = ppo_loss + self.beta_diffusion * diffusion_loss.mean()
+                
+                # Policy update via gradient descent
+                self.actor_optimizer.zero_grad()
+                total_actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.grad_norm)
+                self.actor_optimizer.step()
+
+                # ============================================
+                # Update old policy: theta_old <- theta
+                # ============================================
+                if iteration % 10 == 0:  # Update old policy periodically
+                    self.actor_old.load_state_dict(self.actor.state_dict())
 
                 # EMA update
                 if self.step % self.update_ema_every == 0:
@@ -169,20 +258,24 @@ class Diffusion_PPO(object):
 
                 self.step += 1
 
-                # Log metrics
-                metric['ppo_loss'].append(float(policy_loss.item()) if not torch.isnan(policy_loss) else 0.0)
-                metric['value_loss'].append(float(value_loss.item()) if not torch.isnan(value_loss) else 0.0)
-                metric['actor_loss'].append(float(total_actor_loss.item()) if not torch.isnan(total_actor_loss) else 0.0)
+                # Log metrics (safely handle NaN)
+                metric['ppo_loss'].append(float(ppo_loss.item()) if not (torch.isnan(ppo_loss) or torch.isinf(ppo_loss)) else 0.0)
+                metric['diffusion_loss'].append(float(diffusion_loss.mean().item()) if not (torch.isnan(diffusion_loss).any() or torch.isinf(diffusion_loss).any()) else 0.0)
+                metric['value_loss'].append(float(value_loss.item()) if not (torch.isnan(value_loss) or torch.isinf(value_loss)) else 0.0)
+                metric['actor_loss'].append(float(total_actor_loss.item()) if not (torch.isnan(total_actor_loss) or torch.isinf(total_actor_loss)) else 0.0)
 
             except Exception as e:
                 print(f"Error in PPO training iteration {iteration}: {e}")
+                import traceback
+                traceback.print_exc()
                 metric['ppo_loss'].append(0.0)
+                metric['diffusion_loss'].append(0.0)
                 metric['value_loss'].append(0.0)
                 metric['actor_loss'].append(0.0)
                 continue
 
-        # Learning rate scheduling (more conservative)
-        if self.lr_decay and self.step % 200 == 0:  # Even less frequent LR updates
+        # Learning rate scheduling
+        if self.lr_decay and self.step % 200 == 0:
             self.actor_lr_scheduler.step()
             self.critic_lr_scheduler.step()
 

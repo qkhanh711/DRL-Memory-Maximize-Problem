@@ -1,10 +1,5 @@
-analysis_plots/
-convergence_plots/
-final_plot/
 logs/
+*.sh
+*.png
+*.json
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-*.pyw
-*.pyz

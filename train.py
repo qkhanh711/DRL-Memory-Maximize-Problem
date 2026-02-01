@@ -8,9 +8,6 @@ import random
 
 # Import environment and agents
 from env.m_env import GAIServiceEnv_v1, EnvConfig_v1
-from agents.a2c_diffusion import Diffusion_A2C
-from agents.bc_diffusion import Diffusion_BC
-from agents.gaussian_a2c import Gaussian_A2C
 from agents.gaussian_dql import Gaussian_DQL
 from agents.gaussian_ppo import Gaussian_PPO
 from agents.ppo_diffusion import Diffusion_PPO
@@ -55,9 +52,6 @@ def set_seed(seed):
 def create_agent(agent_name, state_dim, action_dim, max_action, device, **kwargs):
     """Create agent based on name"""
     agents = {
-        'a2c_diffusion': Diffusion_A2C,
-        'bc_diffusion': Diffusion_BC,
-        'gaussian_a2c': Gaussian_A2C,
         'gaussian_dql': Gaussian_DQL,
         'gaussian_ppo': Gaussian_PPO,
         'ppo_diffusion': Diffusion_PPO,
@@ -76,7 +70,7 @@ def create_agent(agent_name, state_dim, action_dim, max_action, device, **kwargs
         **kwargs
     )
 
-def train_agent(agent_name, config, train_config, device):
+def train_agent(agent_name, config, train_config, device, seed = 42):
     """Train a single agent"""
     print(f"\n{'='*50}")
     print(f"Training {agent_name}")
@@ -95,9 +89,11 @@ def train_agent(agent_name, config, train_config, device):
     replay_buffer = ReplayBuffer(max_size=train_config['buffer_size'], device=device)
     
     # Create logger
-    log_dir = f"logs/{agent_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    # log_dir = f"logs/{agent_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    log_dir = f"logs/{seed}/{agent_name}"
     os.makedirs(log_dir, exist_ok=True)
     logger = TrainingLogger(log_dir)
+    convergence_file = os.path.join(log_dir, f"convergence_metrics_qos_{config['qos_required']}_users_{config['num_users']}.json")
     
     # Training metrics
     episode_rewards = []
@@ -109,12 +105,26 @@ def train_agent(agent_name, config, train_config, device):
         'eval_rewards': [],
         'eval_lengths': []
     }
+
+    # Detailed convergence tracking (per-step and per-episode)
+    convergence_metrics = {
+        'agent_name': agent_name,
+        'config': convert_numpy_to_list(config),
+        'train_config': convert_numpy_to_list(train_config),
+        'step_metrics': [],
+        'episode_metrics': [],
+        'eval_metrics': []
+    }
     
     # Training loop
     total_steps = 0
     episode = 0
-    
-    while total_steps < train_config['max_steps']:
+    from tqdm import trange 
+    for _ in trange(train_config['max_steps'], desc="Training Progress"):
+    # while total_steps < train_config['max_steps']:
+        episode_idx = episode + 1
+        last_info = {}
+        
         # Reset environment
         state = env.reset()
         episode_reward = 0
@@ -137,6 +147,18 @@ def train_agent(agent_name, config, train_config, device):
             episode_reward += reward
             episode_length += 1
             total_steps += 1
+            last_info = info
+
+            # Log fine-grained step info for convergence analysis
+            convergence_metrics['step_metrics'].append({
+                'episode': episode_idx,
+                'episode_step': episode_length,
+                'global_step': total_steps,
+                'reward': float(reward),
+                'episode_reward_running': float(episode_reward),
+                'action': convert_numpy_to_list(action),
+                'info': convert_numpy_to_list(info)
+            })
             
             # Train agent if buffer has enough samples
             if replay_buffer.size() >= train_config['min_buffer_size']:
@@ -163,6 +185,14 @@ def train_agent(agent_name, config, train_config, device):
         logger.log_scalar("episode/reward", episode_reward, episode)
         logger.log_scalar("episode/length", episode_length, episode)
         logger.log_scalar("episode/total_steps", total_steps, episode)
+
+        convergence_metrics['episode_metrics'].append({
+            'episode': episode_idx,
+            'total_steps': total_steps,
+            'episode_length': episode_length,
+            'episode_reward': float(episode_reward),
+            'final_info': convert_numpy_to_list(last_info)
+        })
         
         # Store metrics
         training_metrics['episode_rewards'].append(episode_reward)
@@ -176,26 +206,40 @@ def train_agent(agent_name, config, train_config, device):
             
             logger.log_scalar("eval/reward", eval_reward, episode)
             logger.log_scalar("eval/length", eval_length, episode)
+
+            convergence_metrics['eval_metrics'].append({
+                'episode': episode_idx,
+                'avg_eval_reward': float(eval_reward),
+                'avg_eval_length': float(eval_length)
+            })
             
-            print(f"Episode {episode}, Eval Reward: {eval_reward:.2f}, Eval Length: {eval_length:.2f}")
+            # print(f"Episode {episode}, Eval Reward: {eval_reward:.2f}, Eval Length: {eval_length:.2f}")
         
         # Print progress
         if episode % train_config['print_frequency'] == 0:
             avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
             avg_length = np.mean(episode_lengths[-100:]) if len(episode_lengths) >= 100 else np.mean(episode_lengths)
-            print(f"Episode {episode}, Avg Reward: {avg_reward:.2f}, Avg Length: {avg_length:.2f}, Total Steps: {total_steps}")
+            # print(f"\rEpisode {episode}, Avg Reward: {avg_reward:.2f}, Avg Length: {avg_length:.2f}, Total Steps: {total_steps}")
         
         # Save model
-        if episode % train_config['save_frequency'] == 0:
+        if episode % (train_config['save_frequency']*100) == 0:
             agent.save_model(log_dir, id=episode)
+
+        if episode % (train_config['save_frequency']) == 0:
+            with open(f"{log_dir}/training_metrics_qos_{config['qos_required']}_users_{config['num_users']}.json", 'w') as f:
+                json.dump(convert_numpy_to_list(training_metrics), f, indent=2)
+            with open(convergence_file, 'w') as f:
+                json.dump(convert_numpy_to_list(convergence_metrics), f, indent=2)
     
     # Save final metrics
     training_metrics['config'] = convert_numpy_to_list(config)
     training_metrics['train_config'] = convert_numpy_to_list(train_config)
     training_metrics['agent_name'] = agent_name
     
-    with open(f"{log_dir}/training_metrics.json", 'w') as f:
-        json.dump(training_metrics, f, indent=2)
+    with open(f"{log_dir}/training_metrics_qos_{config['qos_required']}_users_{config['num_users']}.json", 'w') as f:
+        json.dump(convert_numpy_to_list(training_metrics), f, indent=2)
+    with open(convergence_file, 'w') as f:
+        json.dump(convert_numpy_to_list(convergence_metrics), f, indent=2)
     
     # Save final model
     agent.save_model(log_dir)
@@ -218,7 +262,7 @@ def evaluate_agent(agent, env, num_episodes=10):
         done = False
         
         while not done and episode_length < 1000:  # Max episode length for eval
-            # Try deterministic=True first, fallback to regular call if not supported
+            # Try deterministic=True first, fallback to regular call if not supportedi
             try:
                 action = agent.sample_action(state, deterministic=True)
             except TypeError:
@@ -239,23 +283,29 @@ def main():
                                'gaussian_dql', 'gaussian_ppo', 'ppo_diffusion', 'ql_diffusion'],
                        help='Agent to train')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--max_steps', type=int, default=100000, help='Maximum training steps')
-    parser.add_argument('--max_episode_length', type=int, default=1000, help='Maximum episode length')
-    parser.add_argument('--buffer_size', type=int, default=100000, help='Replay buffer size')
+    parser.add_argument('--max_steps', type=int, default=10000, help='Maximum training steps')
+    parser.add_argument('--max_episode_length', type=int, default=5, help='Maximum episode length')
+    parser.add_argument('--buffer_size', type=int, default=10000, help='Replay buffer size')
     parser.add_argument('--batch_size', type=int, default=64, help='Training batch size')
-    parser.add_argument('--min_buffer_size', type=int, default=1000, help='Minimum buffer size before training')
+    parser.add_argument('--min_buffer_size', type=int, default=10, help='Minimum buffer size before training')
     parser.add_argument('--train_frequency', type=int, default=1, help='Training frequency (steps)')
     parser.add_argument('--eval_frequency', type=int, default=50, help='Evaluation frequency (episodes)')
     parser.add_argument('--eval_episodes', type=int, default=10, help='Number of evaluation episodes')
     parser.add_argument('--print_frequency', type=int, default=10, help='Print frequency (episodes)')
     parser.add_argument('--save_frequency', type=int, default=100, help='Save frequency (episodes)')
     parser.add_argument('--device', type=str, default='auto', help='Device (cpu/cuda/auto)')
+    parser.add_argument('--qos_required', type=float, default=0.9, help='Required QoS level for the environment')
+    parser.add_argument('--num_users', type=int, default=10, help='Number of users in the environment')
+    parser.add_argument('--device_id', type=int, default=None, help='GPU device ID if using CUDA')
     
     args = parser.parse_args()
     
     # Set device
     if args.device == 'auto':
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        if args.device_id != None:
+            device = torch.device(f'cuda:{args.device_id}' if torch.cuda.is_available() else 'cpu')
+        else:
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     else:
         device = torch.device(args.device)
     
@@ -267,9 +317,13 @@ def main():
     # Environment configuration
     config = EnvConfig_v1("GAIServiceEnv")
     
+    config['qos_required'] = args.qos_required
+    config['num_users'] = args.num_users
+    
+    seed = args.seed
     # Training configuration
     train_config = {
-        'seed': args.seed,
+        'seed': seed,
         'max_steps': args.max_steps,
         'max_episode_length': args.max_episode_length,
         'buffer_size': args.buffer_size,
@@ -293,34 +347,6 @@ def main():
     
     # Agent-specific parameters
     agent_configs = {
-        'a2c_diffusion': {
-            'agent_params': {
-                'lr': 1e-4,
-                'gamma': 0.99,
-                'n_timesteps': 20,
-                'ema_decay': 0.995,
-                'entropy_coef': 0.01,
-                'value_loss_coef': 0.25,
-                'grad_norm': 0.25,
-            }
-        },
-        'bc_diffusion': {
-            'agent_params': {
-                'lr': 2e-4,
-                'discount': 0.99,
-                'tau': 0.005,
-                'n_timesteps': 100,
-            }
-        },
-        'gaussian_a2c': {
-            'agent_params': {
-                'lr': 3e-4,
-                'gamma': 0.99,
-                'value_coef': 0.5,
-                'ent_coef': 0.01,
-                'grad_norm': 1.0,
-            }
-        },
         'gaussian_dql': {
             'agent_params': {
                 'discount': 0.99,
@@ -365,7 +391,7 @@ def main():
             'agent_params': {
                 'discount': 0.99,
                 'tau': 0.005,
-                'n_timesteps': 100,
+                'n_timesteps': 10,
                 'ema_decay': 0.995,
                 'lr': 3e-4,
                 'grad_norm': 1.0,
@@ -376,42 +402,57 @@ def main():
     
     # Determine which agents to train
     if args.agent == 'all':
-        agents_to_train = ['a2c_diffusion', 'bc_diffusion', 'gaussian_a2c', 
-                          'gaussian_dql', 'gaussian_ppo', 'ppo_diffusion', 'ql_diffusion']
+        agents_to_train = ['gaussian_dql', 'gaussian_ppo', 'ppo_diffusion', 'ql_diffusion']
     else:
         agents_to_train = [args.agent]
     
+    
     # Train agents
     all_results = {}
-    
-    for agent_name in agents_to_train:
-        try:
-            # Update train_config with agent-specific parameters
-            current_train_config = train_config.copy()
-            if agent_name in agent_configs:
-                current_train_config.update(agent_configs[agent_name])
-            
-            # Train agent
-            metrics, log_dir = train_agent(agent_name, config, current_train_config, device)
-            all_results[agent_name] = {
-                'metrics': metrics,
-                'log_dir': log_dir
-            }
-            
-        except Exception as e:
-            print(f"Error training {agent_name}: {e}")
-            continue
-    
+    from tqdm import tqdm
+    if (len(agents_to_train) > 1):
+        for i in tqdm(len(agents_to_train), desc="Agents Training"):
+            agent_name = agents_to_train[i]
+            try:
+                # Update train_config with agent-specific parameters
+                current_train_config = train_config.copy()
+                if agent_name in agent_configs:
+                    current_train_config.update(agent_configs[agent_name])
+
+                # Train agent
+                metrics, log_dir = train_agent(agent_name, config, current_train_config, device, seed)
+                all_results[agent_name] = {
+                    'metrics': metrics,
+                    'log_dir': log_dir
+                }
+
+            except Exception as e:
+                print(f"Error training {agent_name}: {e}")
+                continue
+    else:
+        agent_name = agents_to_train[0]
+        # Update train_config with agent-specific parameters
+        current_train_config = train_config.copy()
+        if agent_name in agent_configs:
+            current_train_config.update(agent_configs[agent_name])
+
+        # Train agent
+        metrics, log_dir = train_agent(agent_name, config, current_train_config, device, seed)
+        all_results[agent_name] = {
+            'metrics': metrics,
+            'log_dir': log_dir
+        }
+
     # Save summary results
-    summary = {
-        'config': convert_numpy_to_list(config),
-        'train_config': convert_numpy_to_list(train_config),
-        'results': convert_numpy_to_list(all_results),
-        'timestamp': datetime.now().isoformat()
-    }
+    # summary = {
+    #     'config': convert_numpy_to_list(config),
+    #     'train_config': convert_numpy_to_list(train_config),
+    #     'results': convert_numpy_to_list(all_results),
+    #     'timestamp': datetime.now().isoformat()
+    # }
     
-    with open('training_summary.json', 'w') as f:
-        json.dump(summary, f, indent=2)
+    # with open(f'logs/training_summary_qos_{config["qos_required"]}_users_{config["num_users"]}.json', 'w') as f:
+        # json.dump(summary, f, indent=2)
     
     print(f"\n{'='*50}")
     print("Training Summary")
@@ -420,7 +461,7 @@ def main():
         if 'metrics' in result:
             final_reward = np.mean(result['metrics']['episode_rewards'][-100:]) if result['metrics']['episode_rewards'] else 0
             print(f"{agent_name}: Final Avg Reward = {final_reward:.2f}")
-    print(f"Summary saved to: training_summary.json")
+    print(f"Summary saved to: training_summary_qos_{config['qos_required']}_users_{config['num_users']}.json")
 
 if __name__ == "__main__":
     main()
