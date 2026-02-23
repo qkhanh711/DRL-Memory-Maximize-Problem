@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import numpy as np
 import torch
@@ -6,13 +7,20 @@ import argparse
 from datetime import datetime
 import random
 
-# Import environment and agents
-from env.m_env import GAIServiceEnv_v1, EnvConfig_v1
+# Add parent directory to path to import agents
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Import environment
+from satellite_env import SatelliteMECEnvironment, SystemParameters
+
+# Import agents
 from agents.gaussian_dql import Gaussian_DQL
 from agents.gaussian_ppo import Gaussian_PPO
 from agents.ppo_diffusion import Diffusion_PPO
 from agents.ql_diffusion import Diffusion_QL
 from utils.replay_buffer import ReplayBuffer
+
+
 # Simple logger for training metrics
 class TrainingLogger:
     def __init__(self, log_dir):
@@ -28,16 +36,25 @@ class TrainingLogger:
     def log(self, message):
         print(message)
 
+
 def convert_numpy_to_list(obj):
-    """Convert numpy arrays to lists for JSON serialization"""
+    """Convert numpy arrays and types to JSON serializable format"""
     if isinstance(obj, np.ndarray):
         return obj.tolist()
+    elif isinstance(obj, (np.int_, np.intc, np.intp, np.int8, np.int16, np.int32, 
+                         np.int64, np.uint8, np.uint16, np.uint32, np.uint64)):
+        return int(obj)
+    elif isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
+        return float(obj)
+    elif isinstance(obj, np.bool_):
+        return bool(obj)
     elif isinstance(obj, dict):
         return {key: convert_numpy_to_list(value) for key, value in obj.items()}
-    elif isinstance(obj, list):
+    elif isinstance(obj, (list, tuple)):
         return [convert_numpy_to_list(item) for item in obj]
     else:
         return obj
+
 
 def set_seed(seed):
     """Set random seeds for reproducibility"""
@@ -48,6 +65,7 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+
 
 def create_agent(agent_name, state_dim, action_dim, max_action, device, **kwargs):
     """Create agent based on name"""
@@ -70,30 +88,147 @@ def create_agent(agent_name, state_dim, action_dim, max_action, device, **kwargs
         **kwargs
     )
 
-def train_agent(agent_name, config, train_config, device, seed = 42):
+
+class SatelliteEnvWrapper:
+    """Wrapper to make SatelliteMECEnvironment compatible with RL training"""
+    
+    def __init__(self, env):
+        self.env = env
+        self.params = env.params
+        
+        # Define observation and action spaces similar to gym
+        self.num_mgu = self.params.num_mgu
+        
+        # State: [offloading_decisions, channel_assignments, resolutions, compression_ratio, system_stats]
+        # For simplicity: offload_decisions (N), channel_assignments (N), resolutions (N), compression (1), utilities (N)
+        state_dim = self.num_mgu * 4 + 1  # decisions, channels, resolutions, utilities + compression
+        
+        # Action: [offloading_decisions, channel_assignments, resolutions, compression_ratio]
+        # Continuous action space for simplicity (will be discretized/bounded)
+        action_dim = self.num_mgu * 3 + 1  # decisions, channels, resolutions + compression
+        
+        self.observation_space = type('Space', (), {
+            'shape': (state_dim,),
+            'low': np.zeros(state_dim),
+            'high': np.ones(state_dim)
+        })()
+        
+        self.action_space = type('Space', (), {
+            'shape': (action_dim,),
+            'low': np.zeros(action_dim),
+            'high': np.ones(action_dim)
+        })()
+    
+    def reset(self):
+        """Reset environment and return initial state"""
+        self.env.reset()
+        return self._get_state()
+    
+    def step(self, action):
+        """Execute action and return next state, reward, done, info"""
+        # Decode action
+        self._apply_action(action)
+        
+        # Calculate reward (total utility)
+        stats = self.env.get_statistics()
+        reward = stats['total_utility']
+        
+        # Calculate state
+        next_state = self._get_state()
+        
+        # Episode is done after one step (single-step optimization problem)
+        done = True
+        
+        info = stats
+        info['avg_user_utility'] = stats['avg_user_utility']
+        info['num_satellite_users'] = stats['num_satellite_users']
+        info['num_bs_users'] = stats['num_bs_users']
+        
+        return next_state, reward, done, info
+    
+    def _get_state(self):
+        """Get current state representation"""
+        state = []
+        
+        # Offloading decisions (normalized)
+        state.extend(self.env.offloading_decisions / 1.0)
+        
+        # Channel assignments (normalized by max channels)
+        max_channels = max(self.params.nu_sat, self.params.nu_bs)
+        state.extend(self.env.channel_assignments / max_channels)
+        
+        # Resolutions (already normalized [0, 1])
+        state.extend(self.env.resolutions)
+        
+        # Compression ratio (normalized)
+        state.append(self.env.compression_ratio / self.params.theta_max)
+        
+        # User utilities (normalized by max expected utility)
+        utilities = []
+        for user_idx in range(self.num_mgu):
+            utility = self.env.calculate_utility(user_idx)
+            utilities.append(utility / 100.0)  # Rough normalization
+        state.extend(utilities)
+        
+        return np.array(state, dtype=np.float32)
+    
+    def _apply_action(self, action):
+        """Apply action to environment"""
+        idx = 0
+        
+        # Offloading decisions (binary: 0=satellite, 1=BS)
+        offload_decisions = (action[idx:idx + self.num_mgu] > 0.5).astype(int)
+        idx += self.num_mgu
+        
+        # Channel assignments
+        channels = (action[idx:idx + self.num_mgu] * 19).astype(int)  # Map to [0, 19]
+        channels = np.clip(channels, 0, 19)
+        idx += self.num_mgu
+        
+        # Resolutions (already in [0, 1])
+        resolutions = action[idx:idx + self.num_mgu]
+        resolutions = np.clip(resolutions, self.params.r_min, self.params.r_max)
+        idx += self.num_mgu
+        
+        # Compression ratio
+        compression = action[idx] * self.params.theta_max
+        compression = np.clip(compression, 1.0, self.params.theta_max)
+        
+        # Apply to environment
+        self.env.set_offloading_decisions(offload_decisions, channels)
+        self.env.set_resolutions(resolutions)
+        self.env.set_compression_ratio(compression)
+
+
+def train_agent(agent_name, env_config, train_config, device, seed=42):
     """Train a single agent"""
     print(f"\n{'='*50}")
-    print(f"Training {agent_name}")
+    print(f"Training {agent_name} on Satellite-MEC Environment")
     print(f"{'='*50}")
     
     # Create environment
-    env = GAIServiceEnv_v1(config, seed=train_config['seed'])
+    base_env = SatelliteMECEnvironment(seed=seed)
+    env = SatelliteEnvWrapper(base_env)
+    
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
-    max_action = float(env.action_space.high[0])
+    max_action = 1.0  # Actions are normalized to [0, 1]
+    
+    print(f"State dim: {state_dim}, Action dim: {action_dim}")
     
     # Create agent
-    agent = create_agent(agent_name, state_dim, action_dim, max_action, device, **train_config.get('agent_params', {}))
+    agent = create_agent(agent_name, state_dim, action_dim, max_action, device, 
+                        **train_config.get('agent_params', {}))
     
     # Create replay buffer
     replay_buffer = ReplayBuffer(max_size=train_config['buffer_size'], device=device)
     
     # Create logger
-    # log_dir = f"logs/{agent_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    log_dir = f"logs/{seed}/{agent_name}"
+    log_dir = f"logs/satellite/{seed}/{agent_name}"
     os.makedirs(log_dir, exist_ok=True)
     logger = TrainingLogger(log_dir)
-    convergence_file = os.path.join(log_dir, f"convergence_metrics_qos_{config['qos_required']}_users_{config['num_users']}_Mmax_{config['Mmax']}.json")
+    convergence_file = os.path.join(log_dir, 
+                                   f"convergence_metrics_mgu_{env_config['num_mgu']}.json")
     
     # Training metrics
     episode_rewards = []
@@ -103,13 +238,16 @@ def train_agent(agent_name, config, train_config, device, seed = 42):
         'episode_lengths': [],
         'training_losses': [],
         'eval_rewards': [],
-        'eval_lengths': []
+        'eval_lengths': [],
+        'avg_satellite_users': [],
+        'avg_bs_users': [],
+        'avg_user_utilities': []
     }
 
-    # Detailed convergence tracking (per-step and per-episode)
+    # Detailed convergence tracking
     convergence_metrics = {
         'agent_name': agent_name,
-        'config': convert_numpy_to_list(config),
+        'env_config': convert_numpy_to_list(env_config),
         'train_config': convert_numpy_to_list(train_config),
         'step_metrics': [],
         'episode_metrics': [],
@@ -119,9 +257,9 @@ def train_agent(agent_name, config, train_config, device, seed = 42):
     # Training loop
     total_steps = 0
     episode = 0
-    from tqdm import trange 
-    for _ in trange(train_config['max_steps'], desc="Training Progress"):
-    # while total_steps < train_config['max_steps']:
+    
+    from tqdm import trange
+    for _ in trange(train_config['max_episodes'], desc="Training Progress"):
         episode_idx = episode + 1
         last_info = {}
         
@@ -131,7 +269,7 @@ def train_agent(agent_name, config, train_config, device, seed = 42):
         episode_length = 0
         done = False
         
-        # Episode loop
+        # Episode loop (satellite env is single-step, but we can do multiple for exploration)
         while not done and episode_length < train_config['max_episode_length']:
             # Sample action
             action = agent.sample_action(state)
@@ -149,7 +287,7 @@ def train_agent(agent_name, config, train_config, device, seed = 42):
             total_steps += 1
             last_info = info
 
-            # Log fine-grained step info for convergence analysis
+            # Log fine-grained step info
             convergence_metrics['step_metrics'].append({
                 'episode': episode_idx,
                 'episode_step': episode_length,
@@ -162,7 +300,6 @@ def train_agent(agent_name, config, train_config, device, seed = 42):
             
             # Train agent if buffer has enough samples
             if replay_buffer.size() >= train_config['min_buffer_size']:
-                # Sample multiple batches for training
                 for _ in range(train_config['train_frequency']):
                     if replay_buffer.size() >= train_config['batch_size']:
                         train_metrics = agent.train(
@@ -197,10 +334,14 @@ def train_agent(agent_name, config, train_config, device, seed = 42):
         # Store metrics
         training_metrics['episode_rewards'].append(episode_reward)
         training_metrics['episode_lengths'].append(episode_length)
+        training_metrics['avg_satellite_users'].append(last_info.get('num_satellite_users', 0))
+        training_metrics['avg_bs_users'].append(last_info.get('num_bs_users', 0))
+        training_metrics['avg_user_utilities'].append(last_info.get('avg_user_utility', 0))
         
         # Evaluation
         if episode % train_config['eval_frequency'] == 0:
-            eval_reward, eval_length = evaluate_agent(agent, env, train_config['eval_episodes'])
+            eval_reward, eval_length, eval_info = evaluate_agent(agent, env, 
+                                                                 train_config['eval_episodes'])
             training_metrics['eval_rewards'].append(eval_reward)
             training_metrics['eval_lengths'].append(eval_length)
             
@@ -210,33 +351,32 @@ def train_agent(agent_name, config, train_config, device, seed = 42):
             convergence_metrics['eval_metrics'].append({
                 'episode': episode_idx,
                 'avg_eval_reward': float(eval_reward),
-                'avg_eval_length': float(eval_length)
+                'avg_eval_length': float(eval_length),
+                'eval_info': convert_numpy_to_list(eval_info)
             })
-            
-            # print(f"Episode {episode}, Eval Reward: {eval_reward:.2f}, Eval Length: {eval_length:.2f}")
         
         # Print progress
         if episode % train_config['print_frequency'] == 0:
             avg_reward = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
             avg_length = np.mean(episode_lengths[-100:]) if len(episode_lengths) >= 100 else np.mean(episode_lengths)
-            # print(f"\rEpisode {episode}, Avg Reward: {avg_reward:.2f}, Avg Length: {avg_length:.2f}, Total Steps: {total_steps}")
         
         # Save model
-        if episode % (train_config['save_frequency']*100) == 0:
+        if episode % (train_config['save_frequency'] * 100) == 0:
             agent.save_model(log_dir, id=episode)
 
-        if episode % (train_config['save_frequency']) == 0:
-            with open(f"{log_dir}/training_metrics_qos_{config['qos_required']}_users_{config['num_users']}_Mmax_{config['Mmax']}.json", 'w') as f:
+        if episode % train_config['save_frequency'] == 0:
+            with open(f"{log_dir}/training_metrics_mgu_{env_config['num_mgu']}.json", 'w') as f:
+                print(train_metrics)
                 json.dump(convert_numpy_to_list(training_metrics), f, indent=2)
             with open(convergence_file, 'w') as f:
                 json.dump(convert_numpy_to_list(convergence_metrics), f, indent=2)
     
     # Save final metrics
-    training_metrics['config'] = convert_numpy_to_list(config)
+    training_metrics['env_config'] = convert_numpy_to_list(env_config)
     training_metrics['train_config'] = convert_numpy_to_list(train_config)
     training_metrics['agent_name'] = agent_name
     
-    with open(f"{log_dir}/training_metrics_qos_{config['qos_required']}_users_{config['num_users']}_Mmax_{config['Mmax']}.json", 'w') as f:
+    with open(f"{log_dir}/training_metrics_mgu_{env_config['num_mgu']}.json", 'w') as f:
         json.dump(convert_numpy_to_list(training_metrics), f, indent=2)
     with open(convergence_file, 'w') as f:
         json.dump(convert_numpy_to_list(convergence_metrics), f, indent=2)
@@ -250,10 +390,12 @@ def train_agent(agent_name, config, train_config, device, seed = 42):
     
     return training_metrics, log_dir
 
+
 def evaluate_agent(agent, env, num_episodes=10):
     """Evaluate agent performance"""
     total_rewards = []
     total_lengths = []
+    all_info = []
     
     for _ in range(num_episodes):
         state = env.reset()
@@ -261,48 +403,56 @@ def evaluate_agent(agent, env, num_episodes=10):
         episode_length = 0
         done = False
         
-        while not done and episode_length < 1000:  # Max episode length for eval
-            # Try deterministic=True first, fallback to regular call if not supportedi
+        while not done and episode_length < 100:
             try:
                 action = agent.sample_action(state, deterministic=True)
             except TypeError:
                 action = agent.sample_action(state)
-            state, reward, done, _ = env.step(action)
+            
+            state, reward, done, info = env.step(action)
             episode_reward += reward
             episode_length += 1
         
         total_rewards.append(episode_reward)
         total_lengths.append(episode_length)
+        all_info.append(info)
     
-    return np.mean(total_rewards), np.mean(total_lengths)
+    # Aggregate info
+    avg_info = {
+        'avg_satellite_users': np.mean([i.get('num_satellite_users', 0) for i in all_info]),
+        'avg_bs_users': np.mean([i.get('num_bs_users', 0) for i in all_info]),
+        'avg_user_utility': np.mean([i.get('avg_user_utility', 0) for i in all_info])
+    }
+    
+    return np.mean(total_rewards), np.mean(total_lengths), avg_info
+
 
 def main():
-    parser = argparse.ArgumentParser(description='Train DRL agents on GAIServiceEnv')
+    parser = argparse.ArgumentParser(description='Train DRL agents on Satellite-MEC Environment')
     parser.add_argument('--agent', type=str, default='all', 
-                       choices=['all', 'a2c_diffusion', 'bc_diffusion', 'gaussian_a2c', 
-                               'gaussian_dql', 'gaussian_ppo', 'ppo_diffusion', 'ql_diffusion'],
+                       choices=['all', 'gaussian_dql', 'gaussian_ppo', 'ppo_diffusion', 
+                               'ql_diffusion'],
                        help='Agent to train')
     parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--max_steps', type=int, default=10000, help='Maximum training steps')
+    parser.add_argument('--max_episodes', type=int, default=1000, help='Maximum training episodes')
     parser.add_argument('--max_episode_length', type=int, default=5, help='Maximum episode length')
     parser.add_argument('--buffer_size', type=int, default=10000, help='Replay buffer size')
     parser.add_argument('--batch_size', type=int, default=64, help='Training batch size')
-    parser.add_argument('--min_buffer_size', type=int, default=10, help='Minimum buffer size before training')
+    parser.add_argument('--min_buffer_size', type=int, default=100, help='Minimum buffer size before training')
     parser.add_argument('--train_frequency', type=int, default=1, help='Training frequency (steps)')
     parser.add_argument('--eval_frequency', type=int, default=50, help='Evaluation frequency (episodes)')
     parser.add_argument('--eval_episodes', type=int, default=10, help='Number of evaluation episodes')
     parser.add_argument('--print_frequency', type=int, default=10, help='Print frequency (episodes)')
     parser.add_argument('--save_frequency', type=int, default=100, help='Save frequency (episodes)')
     parser.add_argument('--device', type=str, default='auto', help='Device (cpu/cuda/auto)')
-    parser.add_argument('--qos_required', type=float, default=0.9, help='Required QoS level for the environment')
-    parser.add_argument('--num_users', type=int, default=10, help='Number of users in the environment')
     parser.add_argument('--device_id', type=int, default=None, help='GPU device ID if using CUDA')
-    parser.add_argument('--Mmax', type=int, default=100, help='Maximum memory size') 
+    parser.add_argument('--num_mgu', type=int, default=50, help='Number of Metaverse Ground Users')
+    
     args = parser.parse_args()
     
     # Set device
     if args.device == 'auto':
-        if args.device_id != None:
+        if args.device_id is not None:
             device = torch.device(f'cuda:{args.device_id}' if torch.cuda.is_available() else 'cpu')
         else:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -315,17 +465,15 @@ def main():
     set_seed(args.seed)
     
     # Environment configuration
-    config = EnvConfig_v1("GAIServiceEnv")
+    env_config = {
+        'num_mgu': args.num_mgu,
+        'seed': args.seed
+    }
     
-    config['qos_required'] = args.qos_required
-    config['num_users'] = args.num_users
-    config['Mmax'] = args.Mmax
-    
-    seed = args.seed
     # Training configuration
     train_config = {
-        'seed': seed,
-        'max_steps': args.max_steps,
+        'seed': args.seed,
+        'max_episodes': args.max_episodes,
         'max_episode_length': args.max_episode_length,
         'buffer_size': args.buffer_size,
         'batch_size': args.batch_size,
@@ -407,13 +555,12 @@ def main():
     else:
         agents_to_train = [args.agent]
     
-    
     # Train agents
     all_results = {}
     from tqdm import tqdm
-    if (len(agents_to_train) > 1):
-        for i in tqdm(len(agents_to_train), desc="Agents Training"):
-            agent_name = agents_to_train[i]
+    
+    if len(agents_to_train) > 1:
+        for agent_name in tqdm(agents_to_train, desc="Agents Training"):
             try:
                 # Update train_config with agent-specific parameters
                 current_train_config = train_config.copy()
@@ -421,7 +568,8 @@ def main():
                     current_train_config.update(agent_configs[agent_name])
 
                 # Train agent
-                metrics, log_dir = train_agent(agent_name, config, current_train_config, device, seed)
+                metrics, log_dir = train_agent(agent_name, env_config, current_train_config, 
+                                              device, args.seed)
                 all_results[agent_name] = {
                     'metrics': metrics,
                     'log_dir': log_dir
@@ -429,6 +577,8 @@ def main():
 
             except Exception as e:
                 print(f"Error training {agent_name}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
     else:
         agent_name = agents_to_train[0]
@@ -438,23 +588,13 @@ def main():
             current_train_config.update(agent_configs[agent_name])
 
         # Train agent
-        metrics, log_dir = train_agent(agent_name, config, current_train_config, device, seed)
+        metrics, log_dir = train_agent(agent_name, env_config, current_train_config, 
+                                      device, args.seed)
         all_results[agent_name] = {
             'metrics': metrics,
             'log_dir': log_dir
         }
 
-    # Save summary results
-    # summary = {
-    #     'config': convert_numpy_to_list(config),
-    #     'train_config': convert_numpy_to_list(train_config),
-    #     'results': convert_numpy_to_list(all_results),
-    #     'timestamp': datetime.now().isoformat()
-    # }
-    
-    # with open(f'logs/training_summary_qos_{config["qos_required"]}_users_{config["num_users"]}.json', 'w') as f:
-        # json.dump(summary, f, indent=2)
-    
     print(f"\n{'='*50}")
     print("Training Summary")
     print(f"{'='*50}")
@@ -462,7 +602,8 @@ def main():
         if 'metrics' in result:
             final_reward = np.mean(result['metrics']['episode_rewards'][-100:]) if result['metrics']['episode_rewards'] else 0
             print(f"{agent_name}: Final Avg Reward = {final_reward:.2f}")
-    print(f"Summary saved to: training_summary_qos_{config['qos_required']}_users_{config['num_users']}.json")
+    print(f"Summary saved to logs/satellite/{args.seed}/")
+
 
 if __name__ == "__main__":
     main()
