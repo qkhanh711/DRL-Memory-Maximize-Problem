@@ -5,6 +5,7 @@ import torch
 import argparse
 from datetime import datetime
 import random
+from collections import deque
 
 # Import environment and agents
 from env.m_env import GAIServiceEnv_v1, EnvConfig_v1
@@ -113,8 +114,11 @@ def train_agent(agent_name, config, train_config, device, seed = 42):
         'train_config': convert_numpy_to_list(train_config),
         'step_metrics': [],
         'episode_metrics': [],
-        'eval_metrics': []
+        'eval_metrics': [],
+        'tracked_last_episodes_count': int(train_config.get('track_last_episodes', 10)),
+        'last_episode_trajectories': []
     }
+    last_episode_trajectories = deque(maxlen=int(train_config.get('track_last_episodes', 10)))
     
     # Training loop
     total_steps = 0
@@ -130,6 +134,7 @@ def train_agent(agent_name, config, train_config, device, seed = 42):
         episode_reward = 0
         episode_length = 0
         done = False
+        episode_trajectory = []
         
         # Episode loop
         while not done and episode_length < train_config['max_episode_length']:
@@ -158,6 +163,14 @@ def train_agent(agent_name, config, train_config, device, seed = 42):
                 'episode_reward_running': float(episode_reward),
                 'action': convert_numpy_to_list(action),
                 'info': convert_numpy_to_list(info)
+            })
+
+            episode_trajectory.append({
+                'episode_step': episode_length,
+                'global_step': total_steps,
+                'current_time': float(info.get('current_time', 0.0)),
+                'user_status': convert_numpy_to_list(info.get('user_status', [])),
+                'user_positions': convert_numpy_to_list(info.get('user_positions', [])),
             })
             
             # Train agent if buffer has enough samples
@@ -193,6 +206,13 @@ def train_agent(agent_name, config, train_config, device, seed = 42):
             'episode_reward': float(episode_reward),
             'final_info': convert_numpy_to_list(last_info)
         })
+
+        last_episode_trajectories.append({
+            'episode': episode_idx,
+            'episode_length': episode_length,
+            'trajectory': convert_numpy_to_list(episode_trajectory)
+        })
+        convergence_metrics['last_episode_trajectories'] = list(last_episode_trajectories)
         
         # Store metrics
         training_metrics['episode_rewards'].append(episode_reward)
@@ -298,6 +318,8 @@ def main():
     parser.add_argument('--num_users', type=int, default=10, help='Number of users in the environment')
     parser.add_argument('--device_id', type=int, default=None, help='GPU device ID if using CUDA')
     parser.add_argument('--Mmax', type=int, default=100, help='Maximum memory size') 
+    parser.add_argument('--track_last_episodes', type=int, default=10,
+                       help='How many final episodes to keep detailed user trajectory logs')
     args = parser.parse_args()
     
     # Set device
@@ -335,6 +357,7 @@ def main():
         'eval_episodes': args.eval_episodes,
         'print_frequency': args.print_frequency,
         'save_frequency': args.save_frequency,
+        'track_last_episodes': args.track_last_episodes,
         'agent_params': {
             'lr': 3e-4,
             'gamma': 0.99,

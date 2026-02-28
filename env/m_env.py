@@ -201,6 +201,9 @@ class GAIServiceEnv_v1(gym.Env):
             self.next_queue_check_time += self.config["step_size"]
         
         observation, reward, done, info = self._compute_reward(action)
+
+        # Update user mobility so position changes across timesteps
+        self._move_users()
         
         # Increment step counter and check termination
         self.time_step += 1
@@ -213,6 +216,8 @@ class GAIServiceEnv_v1(gym.Env):
             "current_memory_usage": self.current_memory_usage,
             "queue_size": len(self.queue),
             "total_users_served": self.total_users_served,  # NEW: total served in episode
+            "user_positions": self._get_user_positions(),
+            "user_status": self._get_user_status(),
         })
         
         if done:
@@ -310,6 +315,31 @@ class GAIServiceEnv_v1(gym.Env):
                u.qos_required,
            ])
        return np.array(state, dtype=np.float32)
+
+    def _get_user_positions(self):
+        return [
+            {
+                "user_id": int(u.user_id),
+                "x": float(u.position[0]),
+                "y": float(u.position[1]),
+            }
+            for u in self.users
+        ]
+
+    def _get_user_status(self):
+        queue_set = set(self.queue)
+        completed_set = set(self.completed_users)
+        return [
+            {
+                "user_id": int(u.user_id),
+                "x": float(u.position[0]),
+                "y": float(u.position[1]),
+                "is_served": bool(u.is_served),
+                "is_in_queue": bool(u.user_id in queue_set),
+                "is_completed": bool(u.user_id in completed_set),
+            }
+            for u in self.users
+        ]
 
     def _move_users(self):
         for user in self.users:

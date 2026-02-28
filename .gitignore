@@ -3,3 +3,5 @@ logs/
 *.png
 *.json
 __pycache__/
+.mobility*
+# *.csv
