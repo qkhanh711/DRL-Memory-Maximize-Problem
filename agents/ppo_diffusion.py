@@ -138,7 +138,7 @@ class Diffusion_PPO(object):
         # Compute ratio: pi(a|s) / pi_old(a|s)
         # Since we use loss (negative log prob), ratio = exp(old_loss - current_loss)
         # Clamp the exponent to prevent overflow/underflow
-        log_ratio = torch.clamp(old_loss - current_loss, -20.0, 20.0)
+        log_ratio = torch.clamp(old_loss - current_loss, -10.0, 10.0)
         ratio = torch.exp(log_ratio)
         
         # Check for NaN and replace with 1.0 (no change)

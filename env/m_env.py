@@ -3,6 +3,7 @@
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
+from scipy.special import j0
 
 
 def EnvConfig_v1(envName: str):
@@ -70,9 +71,13 @@ def EnvConfig_v1(envName: str):
         "h0": 1.42e-4,
         "path_loss": 2.0,
         "bandwidth": 1e6,           # Hz
-        "noise_power": 4.0e-21,     # W/Hz
+        "noise_power": 4.0e-21,     # W/Hz  (~-174 dBm/Hz)
         "upload_power": 0.0501,     # W
         "download_power": 0.5012,   # W
+
+        # Jakes fading model
+        "f_c": 2e9,                 # carrier frequency (Hz), 2 GHz
+        "c_light": 3e8,             # speed of light (m/s)
 
         # Reward bonus
         "psi": 100,
@@ -99,8 +104,19 @@ class User:
 
         self.direction = float(self.rng.uniform(0.0, 2.0 * np.pi))
         self.qos_required = config["qos_required"]
-        self.mobility_speed = float(self.rng.uniform(0.5, 2.0))  # m/step
+        self.mobility_speed = float(self.rng.uniform(5, 15))  # m/s, v_i ~ U(0.5, 1.5) per Jakes model
         self.mobility_angle = self.direction
+
+        # Jakes time-correlated small-scale fading state
+        f_c = config.get("f_c", 2e9)
+        c_light = config.get("c_light", 3e8)
+        t_s = config.get("step_size", 1.0)  # sub-slot duration (s)
+        f_D = self.mobility_speed * f_c / c_light  # maximum Doppler frequency
+        self.rho = float(j0(2 * np.pi * f_D * t_s))  # temporal correlation coefficient
+        # Initialize Gamma_{i,0} ~ CN(0, 1)
+        self.gamma: complex = (
+            self.rng.standard_normal() + 1j * self.rng.standard_normal()
+        ) / np.sqrt(2)
         
         self.is_served = False
         self.completion_time = None
@@ -113,6 +129,12 @@ class User:
         dy = self.mobility_speed * np.sin(self.mobility_angle)
         self.position += np.array([dx, dy], dtype=np.float64)
         self.mobility_angle += float(self.rng.uniform(-0.1, 0.1))
+        # Jakes fading evolution: Gamma_{i,t} = rho_i * Gamma_{i,t-1} + sqrt(1-rho_i^2) * daleth
+        # daleth_{i,t} ~ CN(0, 1)
+        daleth = (
+            self.rng.standard_normal() + 1j * self.rng.standard_normal()
+        ) / np.sqrt(2)
+        self.gamma = self.rho * self.gamma + np.sqrt(1.0 - self.rho ** 2) * daleth
 
 
 class GAIServiceEnv_v1(gym.Env):
@@ -348,13 +370,23 @@ class GAIServiceEnv_v1(gym.Env):
     def _distance(self, user: User) -> float:
         user_pos_3d = np.array([user.position[0], user.position[1], 0.0], dtype=np.float64)
         return float(np.linalg.norm(self.config["sp_pos"] - user_pos_3d))
+    
+    def _channel_gain_sq(self, user: "User", distance: float) -> float:
+        """Returns |h_{i,t}|^2 = varkappa_{i,t} * |Gamma_{i,t}|^2
 
-    def _channel_rate(self, distance: float, uplink: bool = True) -> float:
-        # Simple pathloss + Shannon capacity model
-        h_i = self.config["h0"] / (distance ** self.config["path_loss"]) #h_i
+        Large-scale fading:  varkappa_{i,t} = h0 / d_{i,t}^varrho
+        Small-scale fading:  Gamma_{i,t}  (time-correlated Jakes, stored on user)
+        Combined gain:       h_{i,t} = sqrt(varkappa_{i,t}) * Gamma_{i,t}
+        """
+        varkappa = self.config["h0"] / (distance ** self.config["path_loss"])
+        return float(varkappa * abs(user.gamma) ** 2)
+
+    def _channel_rate(self, user: "User", distance: float, uplink: bool = True) -> float:
+        """Shannon capacity using composite fading channel gain |h_{i,t}|^2."""
+        h_sq = self._channel_gain_sq(user, distance)
         B_i = self.config["bandwidth"] / self.config["num_users"]
         pwr = self.config["upload_power"] if uplink else self.config["download_power"]
-        snr = pwr * h_i / (B_i * self.config["noise_power"])
+        snr = pwr * h_sq / (B_i * self.config["noise_power"])
         rate_bits_per_s = B_i * np.log2(1.0 + snr)
         return float(rate_bits_per_s / 8.0)  # bytes/s
 
@@ -413,8 +445,8 @@ class GAIServiceEnv_v1(gym.Env):
     def _compute_latency(self, user: User, denoise_steps: int):
         d = self._distance(user)
 
-        rate_up = self._channel_rate(d, uplink=True)
-        rate_down = self._channel_rate(d, uplink=False)
+        rate_up = self._channel_rate(user, d, uplink=True)
+        rate_down = self._channel_rate(user, d, uplink=False)
         mem_rate = self.config["Rmem"]              
         compute_power = self.config["PVM"]          
 
